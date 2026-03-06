@@ -215,3 +215,25 @@ training/wandb/
 *.pt
 *.pth
 
+
+# --- Engine Generated & Data Files ---
+engine/build*/
+engine/src/tablebases/syzygy/*.rtbz
+engine/src/tablebases/syzygy/*.rtbw
+*.pgn
+*.json
+*.csv
+*.epd
+tools/search_tree*.html
+*.log
+
+# --- Machine Learning & Models ---
+training/models/*.onnx
+training/models/*.pth
+eval_model_onnx/*.data
+eval_model_onnx/onnxruntime-*/
+data/processed/*.bin
+
+# --- Scripts & Temp ---
+run_match*.sh
+test_defaults.*
