@@ -44,10 +44,17 @@ The project uses CMake for build configuration. The native target dynamically li
 *   **CMake**: `3.14+`
 *   **Compiler**: `g++` or `clang` (C++20 required)
 
+The engine requires `onnxruntime` (v1.23.0) for its neural network evaluation. You can automatically download the correct pre-compiled binaries for your operating system (macOS/Linux) by running the included setup script:
+
+```bash
+cd eval_model_onnx
+./download_onnxruntime.sh
+cd ../engine
+```
+
 ### Native Build (Linux / macOS)
 
 ```bash
-cd engine/
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
