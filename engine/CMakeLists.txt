@@ -205,7 +205,7 @@ else()
 
     # Additional Tools
     add_executable(benchmark_eval 
-        src/benchmark_eval.cpp
+        src/tools/benchmark_eval.cpp
         src/eval/Evaluator.cpp src/eval/EvalContext.cpp src/eval/EvalContextMoE.cpp src/eval/SimpleEvalContext.cpp
         ${CMAKE_SOURCE_DIR}/../preprocessing/src/FeatureExtractor.cpp
     )
