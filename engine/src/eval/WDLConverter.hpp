@@ -1,6 +1,8 @@
 #pragma once
+
 /**
- * WDLConverter - Converts neural network WDL + mate_dist outputs to centipawns.
+ * @file WDLConverter.hpp
+ * @brief Converts neural network WDL outputs to centipawns.
  *
  * IMPORTANT: This is the INVERSE of WDLNormalizer.hpp's handle_centipawns().
  * The training formula uses a 0.3 factor that must be accounted for.
@@ -19,103 +21,48 @@
  *
  * Features:
  *   - Correct inversion of the 0.3 scaling factor
- *   - Dual-signal mate detection (WDL AND mate_dist must agree)
  *   - Aggression parameter for playstyle tuning (-1.0 to +1.0)
  */
 
 #include <algorithm>
 #include <cmath>
 
+/**
+ * @class WDLConverter
+ * @brief Handles conversion between Win-Draw-Loss probabilities and centipawn scores.
+ */
 class WDLConverter {
 public:
+  /**
+   * @struct WDL
+   * @brief Holds Win, Draw, and Loss probabilities.
+   */
   struct WDL {
-    float win, draw, loss, mate;
+    float win, draw, loss;
   };
-  // Must match WDLNormalizer.hpp
-  static constexpr float MATE_DECAY = 0.5f;
 
   // Score ranges
-  static constexpr int MATE_SCORE = 30000;
   static constexpr int MAX_CP = 15000;
 
   // Lichess constant: 1 / 0.00368208 (exact, from WDLNormalizer.hpp)
   static constexpr float WDL_SCALE = 1.0f / 0.00368208f;
 
-  // Mate boost parameters
-  static constexpr float MATE_DIST_THRESHOLD = 0.1f; // Start boosting at ~M5
-  static constexpr float WDL_DECISIVE_THRESHOLD =
-      0.80f;                                 // Only boost if 80%+ confident
-  static constexpr int MATE_BOOST_MAX = 200; // Maximum boost in centipawns
-
   // Aggression parameter: -1.0 = defensive, 0 = neutral, +1.0 = aggressive
   float aggression = 0.0f;
 
   /**
-   * Convert WDL + mate_dist to centipawn evaluation.
+   * Convert WDL to centipawn evaluation.
    *
    * @param win       Win probability [0, 1]
    * @param draw      Draw probability [0, 1]
    * @param loss      Loss probability [0, 1]
-   * @param mate_dist Mate distance from network [0, 1] (1.0 = M1)
    * @return Centipawn score (positive = STM is winning)
    */
-  int convert(float win, float draw, float loss, float mate_dist) const {
-    // Always use WDL as the base evaluation
-    int base_cp = convertWDL(win, draw, loss);
-
-    // Garbage sanitization (NN out of bounds or NaN/Inf safety)
-    if (std::isnan(mate_dist) || std::isinf(mate_dist) || mate_dist < 0.0f || mate_dist > 1.0f) {
-        return base_cp;
-    }
-
-    // Add a small boost when mate is indicated
-    // Boost scales with mate_dist (closer mates = bigger boost)
-    if (mate_dist > MATE_DIST_THRESHOLD) {
-      bool wdl_decisive =
-          (win > WDL_DECISIVE_THRESHOLD || loss > WDL_DECISIVE_THRESHOLD);
-
-      if (wdl_decisive) {
-        // Boost proportional to mate_dist: M1 (1.0) = full boost, M5 (0.1) =
-        // small boost
-        float boost_factor = std::clamp((mate_dist - MATE_DIST_THRESHOLD) / (1.0f - MATE_DIST_THRESHOLD), 0.0f, 1.0f);
-        int boost = static_cast<int>(boost_factor * MATE_BOOST_MAX);
-
-        // Apply boost in same direction as evaluation
-        if (base_cp > 0) {
-          int mate_val = MATE_SCORE - static_cast<int>(boost_factor * 200.0f); // safer math
-          return std::max(base_cp + boost, mate_val);
-        } else {
-          int mate_val = -MATE_SCORE + static_cast<int>(boost_factor * 200.0f); // safer math
-          return std::min(base_cp - boost, mate_val);
-        }
-      }
-    }
-
-    return base_cp;
+  int convert(float win, float draw, float loss) const {
+    return convertWDL(win, draw, loss);
   }
 
 private:
-  /**
-   * Convert mate position to centipawn score.
-   *
-   * Inverts the WDLNormalizer.hpp formula:
-   *   mate_dist = exp(-MATE_DECAY * (moves - 1))
-   *   → moves = 1 - ln(mate_dist) / MATE_DECAY
-   */
-  int convertMate(float win, float loss, float mate_dist) const {
-    // Invert exponential: moves = 1 + (-ln(mate_dist) / MATE_DECAY)
-    float log_dist = std::log(std::max(mate_dist, 1e-6f));
-    int moves = 1 + static_cast<int>(-log_dist / MATE_DECAY);
-    moves = std::clamp(moves, 1, 100);
-
-    // Convert to plies (half-moves): M1 = 1 ply, M2 = 3 plies, M3 = 5 plies
-    int plies = moves * 2 - 1;
-
-    // Determine sign from WDL
-    bool we_mate = (win > loss);
-    return we_mate ? (MATE_SCORE - plies) : (-MATE_SCORE + plies);
-  }
-
   /**
    * Convert WDL to centipawns - CORRECT INVERSE of WDLNormalizer.
    *

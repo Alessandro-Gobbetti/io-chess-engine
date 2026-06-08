@@ -1,35 +1,55 @@
 #pragma once
-// Evaluator.h - ONNX Runtime-based evaluation context
-// Standard CPU inference for Chess Engine
+
+/**
+ * @file Evaluator.h
+ * @brief Runtime evaluator manager.
+ *
+ * Supports native incremental MoE cache bundles for engine runtime,
+ * managing the shared models and creating thread-local contexts.
+ */
 
 #include "IEvaluator.h"
 #include <memory>
-#include <onnxruntime_cxx_api.h>
 #include <string>
-#include <vector>
 
-// ============================================================================
-// Evaluator - Model manager with SHARED sessions
-// ============================================================================
+struct EvalContextMoECacheSharedModel;
+
+/**
+ * @class Evaluator
+ * @brief Model manager that shares native weights across threads.
+ *
+ * It is responsible for loading the neural network architecture (or falling
+ * back to simple evaluation) and instantiating thread-local `IEvaluator`
+ * contexts that share the read-only weights to save memory.
+ */
 class Evaluator {
 private:
-  Ort::Env env_;
   std::string modelPath_;
+  std::string nativeWeightsPath_;
   int numThreads_;
-  bool isMoE_;
+  bool isMoECache_;
   bool useGPU_;
 
-  // SHARED sessions (created once, used by all thread contexts)
-  std::unique_ptr<Ort::Session> sharedSession_;
-  std::unique_ptr<Ort::Session> sharedBackboneSession_;
-  std::vector<std::unique_ptr<Ort::Session>> sharedExpertSessions_;
+  std::shared_ptr<const EvalContextMoECacheSharedModel> sharedMoECacheModel_; ///< Shared native model used by all thread contexts.
 
 public:
+  /**
+   * @brief Constructs an Evaluator manager.
+   * 
+   * @param modelPath Path to the network weights file.
+   * @param numThreads Number of threads that will request contexts.
+   * @param useGPU Whether to accelerate evaluation using the GPU (if supported).
+   */
   Evaluator(const std::string &modelPath, int numThreads, bool useGPU = false);
 
-  // Create lightweight thread context from shared sessions
+  /**
+   * @brief Creates a lightweight thread context from the shared model.
+   * 
+   * @return A unique pointer to an IEvaluator instance for a specific thread.
+   */
   std::unique_ptr<IEvaluator> createThreadContext();
   
-  bool isLoaded() const { return sharedSession_ != nullptr || sharedBackboneSession_ != nullptr; }
-  bool isMoE() const { return isMoE_; }
+  bool isLoaded() const { return isMoECache_; }
+  bool isMoE() const { return false; }
+  bool isMoECache() const { return isMoECache_; }
 };

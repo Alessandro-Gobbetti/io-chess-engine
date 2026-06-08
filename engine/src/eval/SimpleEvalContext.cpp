@@ -1,3 +1,8 @@
+/**
+ * @file SimpleEvalContext.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "SimpleEvalContext.h"
 #include <algorithm>
 #include <bit>
@@ -161,7 +166,8 @@ static inline int mirror(int sq) {
 //  3. THE NEW EVALUATE FUNCTION
 // =============================================================================
 
-float SimpleEvalContext::evaluate(const Board &board) {
+float SimpleEvalContext::evaluate(const Board &board, int ply) {
+    (void)ply;
     Score score = {0, 0};
     int phase = 0;
     const int PHASE_TOTAL = 24;
