@@ -1,0 +1,191 @@
+/**
+ * @page preprocessing Preprocessing
+ *
+ * @tableofcontents
+ *
+ * The Preprocessing module is a high-performance C++ pipeline that converts
+ * millions of raw chess positions (FEN strings with evaluation labels) into
+ * compact binary datasets that the training pipeline can consume directly.
+ * It is written in C++ rather than Python because feature extraction from
+ * bitboard representations benefits enormously from low-level optimisations.
+ *
+ * @section prep_overview Overview
+ *
+ * The preprocessing pipeline performs three key tasks:
+ *
+ * 1. **Parse** FEN strings and Stockfish evaluation labels from CSV input.
+ * 2. **Extract** spatial feature planes from each position (piece maps,
+ *    distance metrics, pawn structures, slider alignments).
+ * 3. **Serialise** the features and labels into a packed binary format
+ *    optimised for random-access by the PyTorch dataloader.
+ *
+ * A typical run processes 100M+ positions in under an hour on a modern
+ * workstation.
+ *
+ * Detailed documentation for each stage:
+ *
+ * - @subpage prep_features — Spatial feature planes computed per position
+ * - @subpage prep_output — Binary serialisation and pipeline usage
+ *
+ * @section prep_dir Directory Layout
+ *
+ * @code{.unparsed}
+ * preprocessing/
+ * ├── CMakeLists.txt / Makefile
+ * ├── src/
+ * │   ├── main.cpp                  # Entry point, CSV reader
+ * │   ├── FactorizedFeatureExtractor.cpp
+ * │   ├── FeatureExtractor.cpp      # Legacy v1 extractor
+ * │   └── Writers.cpp               # Binary serialisation
+ * ├── include/
+ * │   ├── FactorizedFeatureExtractor.hpp
+ * │   ├── FeatureExtractor.hpp
+ * │   ├── ExpertRouter.hpp          # Position → expert label
+ * │   ├── EvalNormalizer.hpp        # Centipawn normalisation
+ * │   ├── WDLNormalizer.hpp         # WDL target computation
+ * │   └── Writers.hpp
+ * └── lib/chess/                    # Lightweight chess logic
+ * @endcode
+ */
+
+/**
+ * @page prep_features Feature Extraction
+ *
+ * @tableofcontents
+ *
+ * Feature extraction is the most computationally intensive part of the
+ * preprocessing pipeline. Each chess position is encoded into a set of
+ * spatial feature planes (8×8 grids) and scalar features that together
+ * capture the essential information about the position.
+ *
+ * @section prep_factorized Factorized Features (v2)
+ *
+ * The `FactorizedFeatureExtractor` computes the current feature set used
+ * by the Factorized MoE network. Features are grouped into categories:
+ *
+ * @subsection prep_feat_pieces Piece Placement Planes
+ *
+ * Twelve binary 8×8 planes (one per piece type and colour) encoding the
+ * presence of each piece on each square. These are the most basic input
+ * features and provide the foundation for all other computations.
+ *
+ * @subsection prep_feat_chebyshev Chebyshev Distance Maps
+ *
+ * Distance metrics between key squares, computed using Chebyshev distance
+ * (the number of king moves required to travel between two squares):
+ *
+ * - **King-to-piece distances**: For each piece, the Chebyshev distance to
+ *   both the friendly and enemy king. These capture king safety (is a piece
+ *   near the opponent's king?) and endgame dynamics (is the king near a
+ *   passed pawn?).
+ * - **King-to-king distance**: The distance between the two kings, which
+ *   is a strong signal for endgame evaluation (opposition, king activity).
+ *
+ * @subsection prep_feat_pawn Pawn Structure Encodings
+ *
+ * Pawn-specific structural features computed from the pawn bitboards:
+ *
+ * | Feature | Description |
+ * |---------|-------------|
+ * | Passed pawns | Pawns with no opposing pawns ahead on the same or adjacent files |
+ * | Backward pawns | Pawns that cannot advance without being captured and have no friendly pawn support |
+ * | Isolated pawns | Pawns with no friendly pawns on adjacent files |
+ * | Doubled pawns | Multiple pawns of the same colour on the same file |
+ * | Front-span maps | The set of squares ahead of each pawn, encoding pawn chains and pawn breaks |
+ *
+ * @subsection prep_feat_sliders Slider Ray Alignments
+ *
+ * Attack and pin ray maps for sliding pieces (bishops, rooks, queens)
+ * relative to the kings:
+ *
+ * - **Pin ray maps**: Squares on a ray between a slider and the enemy king
+ *   that contain a single intervening piece (a potential pin target).
+ * - **X-ray maps**: Rays that pass through a piece to attack a square
+ *   behind it.
+ *
+ * @subsection prep_feat_scalar Scalar Features
+ *
+ * - Castling rights (4 bits: white/black kingside/queenside).
+ * - En-passant target square.
+ * - Side to move.
+ *
+ * @section prep_routing Expert Routing Labels
+ *
+ * The `ExpertRouter` classifies each position into one of four categories
+ * that correspond to the MoE experts. These labels are used during
+ * Phase 2 (Router Warm-Up) and Phase 3 (Expert Specialisation) of
+ * training:
+ *
+ * | Category | Heuristic |
+ * |----------|-----------|
+ * | **Tactical** | High capture/check potential, queen present, threats |
+ * | **Strategical** | Middlegame with stable pawn structure, no immediate tactics |
+ * | **Major endgame** | ≤ 1 minor piece per side, rook or queen present |
+ * | **Minor endgame** | Only minor pieces and pawns remain |
+ *
+ * @see FactorizedFeatureExtractor, ExpertRouter
+ *
+ * @section prep_legacy Legacy Features (v1)
+ *
+ * The older `FeatureExtractor` uses a simpler set of input features
+ * (piece-only planes without distance maps or pawn structure) and produces
+ * a different binary layout. It is retained for backward compatibility
+ * with v1 model weights and is not used by the current training pipeline.
+ *
+ * @see FeatureExtractor
+ */
+
+/**
+ * @page prep_output Binary Output and Pipeline
+ *
+ * @tableofcontents
+ *
+ * @section prep_format Binary File Format
+ *
+ * The `Writers` module serialises extracted features and labels into a
+ * custom binary `.bin` format optimised for fast random-access by the
+ * PyTorch dataloader. Each record in the file contains:
+ *
+ * | Field | Type | Size | Description |
+ * |-------|------|------|-------------|
+ * | Feature planes | `float32` | N × 8 × 8 | Dense spatial features |
+ * | Evaluation target | `int16` | 2 bytes | Stockfish centipawn evaluation |
+ * | WDL target | `float32[3]` | 12 bytes | Win/Draw/Loss probabilities |
+ * | Expert label | `uint8` | 1 byte | Routing category (0-3) |
+ *
+ * Records are fixed-size, enabling O(1) random access via memory-mapped
+ * I/O in the dataloader. No per-record headers or delimiters are used.
+ *
+ * @section prep_normalisation Target Normalisation
+ *
+ * Raw Stockfish centipawn evaluations span a wide range (±10000+) and
+ * contain outliers (forced mates, tablebase scores). The preprocessing
+ * pipeline applies two normalisation steps:
+ *
+ * - **EvalNormalizer**: Clamps evaluations to a configurable centipawn
+ *   range and scales them to [-1, +1].
+ * - **WDLNormalizer**: Converts centipawn scores to Win/Draw/Loss
+ *   probability vectors using a logistic model calibrated to match
+ *   real game outcomes at different evaluation ranges.
+ *
+ * @see EvalNormalizer, WDLNormalizer
+ *
+ * @section prep_pipeline Running the Pipeline
+ *
+ * The preprocessing binary reads FEN + evaluation CSV lines from stdin
+ * and writes packed `.bin` files to disk:
+ *
+ * @code{.sh}
+ * # Basic usage
+ * zstdcat lichess_evals.csv.zst | ./preprocess --output train.bin --format factorized
+ *
+ * # Multi-drive parallel generation
+ * ./split_preprocess_two_drives.sh input.csv /mnt/ssd1/out /mnt/ssd2/out
+ * @endcode
+ *
+ * For very large datasets (100M+ positions), the included
+ * `split_preprocess_two_drives.sh` script splits the input across two
+ * output drives to maximise I/O throughput.
+ *
+ * @see Writers
+ */

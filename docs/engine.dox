@@ -1,0 +1,364 @@
+/**
+ * @page engine Engine
+ *
+ * @tableofcontents
+ *
+ * The engine is the core C++ application that plays chess. It implements the
+ * Universal Chess Interface (UCI) protocol, runs the search algorithm, and
+ * evaluates positions using a natively-compiled Factorized Mixture-of-Experts
+ * neural network — or a classical heuristic fallback when no weights are
+ * loaded.
+ *
+ * The engine is split into three logical subsystems, each documented in
+ * detail below:
+ *
+ * - @subpage engine_search — The search algorithm and move ordering
+ * - @subpage engine_eval — Neural network evaluation and heuristic fallback
+ * - @subpage engine_infrastructure — Transposition table, time control, UCI, tablebases, and opening book
+ *
+ * @section engine_dir Directory Layout
+ *
+ * @code{.unparsed}
+ * engine/
+ * ├── CMakeLists.txt          # Build configuration
+ * ├── src/
+ * │   ├── main.cpp            # Entry point
+ * │   ├── Types.h             # Shared type definitions
+ * │   ├── feature_api.cpp     # Feature bridge for native inference
+ * │   ├── search/
+ * │   │   ├── Negamax.h/cpp   # Core search algorithm
+ * │   │   ├── MovePicker.h/cpp # Move generation and ordering
+ * │   │   ├── MCTS.h/cpp      # Monte Carlo Tree Search (experimental)
+ * │   │   ├── TT.h/cpp        # Transposition table
+ * │   │   ├── TimeManager.h   # Time allocation
+ * │   │   ├── SearchHeuristics.h # Killer, history, counter-move tables
+ * │   │   ├── ISearch.h       # Search interface
+ * │   │   └── TablebaseFallback.h/cpp
+ * │   ├── eval/
+ * │   │   ├── Evaluator.h/cpp       # Evaluator dispatcher
+ * │   │   ├── IEvaluator.h          # Evaluator interface
+ * │   │   ├── EvalContextMoECache.h/cpp # Native MoE inference
+ * │   │   ├── SimpleEvalContext.h/cpp   # Classical piece-square tables
+ * │   │   ├── MoERouting.h          # Expert routing logic
+ * │   │   └── WDLConverter.hpp      # Centipawn ↔ WDL conversion
+ * │   ├── uci/
+ * │   │   ├── UCI.h/cpp       # UCI command loop
+ * │   │   └── UciOptions.h/cpp # Dynamic option parsing
+ * │   ├── book/
+ * │   │   ├── polyglot_book.h/cpp  # Polyglot book reader
+ * │   │   └── polyglot_keys.cpp    # Zobrist key tables
+ * │   └── tablebases/
+ * │       ├── Tablebase.h/cpp      # Syzygy probing API
+ * │       └── tbprobe/             # Fathom probing library
+ * @endcode
+ */
+
+/**
+ * @page engine_search Search
+ *
+ * @tableofcontents
+ *
+ * The search subsystem is responsible for finding the best move in a given
+ * position. It explores the game tree using a sophisticated combination of
+ * algorithms, pruning techniques, and heuristics that have been refined
+ * over decades of computer chess research.
+ *
+ * @section search_negamax Negamax with Alpha-Beta Pruning
+ *
+ * At its core, the search uses the **Negamax** framework with **alpha-beta
+ * pruning** — the standard game-tree search for two-player zero-sum games.
+ * The key insight is that a position's value for the side to move is the
+ * negation of its value for the opponent, which simplifies the min-max
+ * recursion into a single function.
+ *
+ * The main entry point is `Negamax::iterativeDeepening()`, which repeatedly
+ * calls `Negamax::search()` at increasing depths. Each iteration starts
+ * with a narrow **aspiration window** around the previous iteration's score;
+ * if the search fails high or low, the window is widened and the iteration
+ * is restarted. This approach significantly reduces the number of nodes
+ * explored while still guaranteeing correctness.
+ *
+ * @subsection search_pvs Principal Variation Search (PVS)
+ *
+ * Once the first move at each node has been searched with a full window,
+ * subsequent moves are searched with a **zero window** (alpha, alpha+1).
+ * If a zero-window search fails high, the move is re-searched with the
+ * full window. Because move ordering is usually excellent, the vast
+ * majority of moves are quickly refuted by the zero-window probe.
+ *
+ * @section search_pruning Pruning and Reduction Techniques
+ *
+ * The following techniques are applied to reduce the search tree size
+ * without compromising the quality of the best move:
+ *
+ * | Technique | Description | Location in tree |
+ * |-----------|-------------|------------------|
+ * | **Null-move pruning** | Gives the opponent a free move; if they still can't beat beta, the position is likely too good | Internal nodes |
+ * | **Late Move Reductions (LMR)** | Moves ordered late in the list are searched at reduced depth | Internal nodes, quiet moves |
+ * | **Futility pruning** | Near leaf nodes, moves that cannot possibly raise alpha are skipped | Near leaves (depth ≤ 3) |
+ * | **Reverse futility pruning** | If the static eval is far above beta, a beta cutoff is returned immediately | Near leaves |
+ * | **Singular extensions** | When the transposition table move is significantly better than all alternatives, extend its search by 1 ply | Internal nodes |
+ * | **Check extensions** | Positions where the side to move is in check are extended to avoid missing forced mates | All nodes |
+ * | **Delta pruning** | In quiescence search, captures that cannot raise alpha even with the best possible material gain are skipped | Quiescence nodes |
+ *
+ * @section search_quiescence Quiescence Search
+ *
+ * At the leaves of the main search, `Negamax::quiescence()` continues
+ * searching all captures and check evasions until the position is "quiet"
+ * — no more tactical exchanges are possible. This prevents the **horizon
+ * effect**, where the engine misjudges a position because it stops
+ * searching right before a queen capture or a checkmate.
+ *
+ * @section search_move_ordering Move Ordering
+ *
+ * Effective move ordering is the single most important factor for alpha-beta
+ * efficiency: if the best move is searched first, the remaining moves are
+ * quickly pruned. The `MovePicker` class yields moves in the following
+ * priority order:
+ *
+ * 1. **Hash move** — The best move from the transposition table. If the
+ *    current position has been searched before, this move is overwhelmingly
+ *    likely to be the best or near-best.
+ * 2. **Winning captures** — Captures whose Static Exchange Evaluation (SEE)
+ *    is positive, ordered by SEE value. A queen capturing a defended pawn
+ *    loses material (SEE < 0) and is demoted.
+ * 3. **Killer moves** — Quiet moves that caused a beta cutoff at sibling
+ *    nodes at the same ply. The engine stores two killer moves per ply.
+ * 4. **Counter moves** — The last quiet move that refuted the opponent's
+ *    previous move.
+ * 5. **Quiet moves** — All remaining moves, sorted by a **history heuristic**
+ *    score that accumulates statistics about which moves cause cutoffs
+ *    across the entire search.
+ * 6. **Losing captures** — Captures with SEE < 0, tried last as a
+ *    last resort.
+ *
+ * @see MovePicker, SearchHeuristics
+ *
+ * @section search_smp Multi-Threaded Search (Lazy SMP)
+ *
+ * The engine supports multi-threaded search using the **Lazy SMP** approach.
+ * Multiple threads search the same root position independently at slightly
+ * staggered depths (thread 0 searches depth *d*, thread 1 searches
+ * *d*+1, etc.). All threads share a single **lock-free transposition table**,
+ * so discoveries made by one thread immediately benefit the others through
+ * hash table lookups.
+ *
+ * This approach is remarkably simple and effective: it requires no
+ * split-point synchronisation, no complex work-stealing, and scales
+ * well up to 8-16 threads on modern hardware. The thread count is
+ * configurable via the UCI `Threads` option.
+ *
+ * @see Negamax, ISearch
+ */
+
+/**
+ * @page engine_eval Evaluation
+ *
+ * @tableofcontents
+ *
+ * The evaluation subsystem assigns a numerical score to any chess position,
+ * estimating how favourable it is for the side to move. This score guides
+ * the search algorithm: a higher score means the position is better for
+ * the side to move.
+ *
+ * @section eval_moe Neural Evaluation — Factorized MoE
+ *
+ * The primary evaluator is a **Factorized Mixture-of-Experts (MoE)** network
+ * that has been trained on hundreds of millions of positions and compiled
+ * to native C++ with SIMD-optimised inference. No external ML runtime
+ * (ONNX, TensorFlow, etc.) is required.
+ *
+ * @subsection eval_moe_arch Architecture
+ *
+ * The network consists of three main components:
+ *
+ * - **1×1 Mixer**: Computes dense feature embeddings from the raw input
+ *   planes (piece placements, Chebyshev distances, pawn structures) using
+ *   pointwise convolutions. The mixer output feeds both the router and the
+ *   expert bodies.
+ *
+ * - **Router (Gating Network)**: A lightweight classification head that
+ *   examines the mixer features and selects the **top-2 experts** (out of 4)
+ *   for the current position. The router outputs a softmax distribution
+ *   over experts, and only the top-2 are activated — keeping inference
+ *   cost constant regardless of how many experts exist.
+ *
+ * - **Expert Bodies**: Four specialised 3×3 convolutional sub-networks,
+ *   each trained to excel at a different class of positions:
+ *
+ *   | Expert | Specialisation | Typical positions |
+ *   |--------|---------------|-------------------|
+ *   | Expert 0 | **Tactical** | Checks, captures, pins, forks |
+ *   | Expert 1 | **Strategical** | Pawn structure, piece activity, space |
+ *   | Expert 2 | **Major-piece endgame** | Rook endings, queen endings |
+ *   | Expert 3 | **Minor-piece endgame** | Bishop/knight endings, opposite-colour bishops |
+ *
+ * @image html model.png "Factorized MoE Neural Network Architecture" width=800px
+ *
+ * @subsection eval_moe_incremental Incremental Updates (Double-Accumulator)
+ *
+ * Rather than recomputing all feature planes from scratch on every ply of
+ * the search tree, the engine maintains a **double-accumulator** that tracks
+ * incremental feature deltas as pieces move. When a move is made:
+ *
+ * 1. The affected input planes are updated (piece added/removed).
+ * 2. The mixer output is updated incrementally.
+ * 3. Only the activated experts run their 3×3 convolutions.
+ *
+ * This makes evaluation extremely fast inside the search tree — typically
+ * under 1 μs per position on modern hardware.
+ *
+ * @see EvalContextMoECache, MoERouting
+ *
+ * @section eval_heuristic Heuristic Fallback
+ *
+ * When no neural network weights are loaded, the engine falls back to a
+ * classical evaluation implemented in `SimpleEvalContext`. This evaluator
+ * uses:
+ *
+ * - **Material counting**: Standard piece values (pawn=100, knight=320, etc.)
+ * - **Piece-square tables**: Phase-dependent positional bonuses for each
+ *   piece on each square (e.g. centralised knights are worth more).
+ * - **King safety terms**: Penalty for exposed kings, bonus for castled
+ *   king positions.
+ *
+ * While far weaker than the neural evaluation, the heuristic fallback
+ * allows the engine to play reasonable chess without any external data files.
+ *
+ * @see SimpleEvalContext, Evaluator, IEvaluator
+ *
+ * @section eval_wdl Win-Draw-Loss Conversion
+ *
+ * Internal centipawn scores are converted to **Win/Draw/Loss (WDL)
+ * probabilities** using a logistic model fitted to self-play data. This
+ * enables the engine to report UCI `wdl` statistics and allows the search
+ * to make draw-aware decisions (e.g. avoiding drawn endgames when ahead).
+ *
+ * @see WDLConverter
+ */
+
+/**
+ * @page engine_infrastructure Infrastructure
+ *
+ * @tableofcontents
+ *
+ * The infrastructure subsystem provides all the supporting components
+ * that the search and evaluation depend on: hash tables, time control,
+ * protocol handling, endgame databases, and opening theory.
+ *
+ * @section infra_tt Transposition Table
+ *
+ * The transposition table (TT) is a large hash table that stores results
+ * from previously searched positions. Because many different move sequences
+ * lead to the same position (transpositions), the TT avoids redundant work
+ * and is the single most impactful data structure in a chess engine.
+ *
+ * Each entry stores:
+ *
+ * | Field | Description |
+ * |-------|-------------|
+ * | Zobrist key | 64-bit position hash for collision detection |
+ * | Best move | The move that was best when this position was last searched |
+ * | Score | The evaluation score at the stored depth |
+ * | Depth | How deeply this position was searched |
+ * | Bound type | Whether the score is exact, a lower bound (fail-high), or an upper bound (fail-low) |
+ * | Age | Generation counter for replacement decisions |
+ *
+ * The table uses a **bucket-based replacement scheme**: each hash index
+ * maps to a bucket of entries, and new entries replace the shallowest or
+ * oldest entry in the bucket. Table size is configured at startup via the
+ * UCI `Hash` option (in megabytes, default 64 MB).
+ *
+ * Because all search threads share a single TT instance, entries are
+ * accessed using **lock-free atomic operations** to avoid data races.
+ *
+ * @see TT
+ *
+ * @section infra_time Time Management
+ *
+ * The `TimeManager` converts the remaining clock time and increment into
+ * a per-move time budget. Good time management is crucial: spending too
+ * long on one move can leave the engine in time trouble later, while
+ * moving too quickly wastes potential depth.
+ *
+ * Supported time control modes:
+ *
+ * | Mode | Description |
+ * |------|-------------|
+ * | **Fischer increment** | Time + increment per move |
+ * | **Bronstein delay** | Time with delay before clock starts |
+ * | **Fixed time per move** | Exact time budget per move (`movetime`) |
+ * | **Infinite analysis** | No time limit (`infinite`) |
+ * | **Depth limit** | Search to a fixed depth (`depth`) |
+ * | **Node limit** | Search a fixed number of nodes (`nodes`) |
+ *
+ * The time manager also implements **dynamic extension**: when the root
+ * best move changes between iterations (indicating instability), the
+ * engine allocates extra time to resolve the uncertainty before committing.
+ *
+ * @see TimeManager
+ *
+ * @section infra_tablebase Endgame Tablebases (Syzygy)
+ *
+ * When 6 or fewer pieces remain on the board, the engine probes
+ * **Syzygy endgame tablebases** for theoretically perfect play. These
+ * tablebases contain the complete solution for every possible position
+ * with up to 6 pieces.
+ *
+ * Probing happens at two levels:
+ *
+ * - **Root probing**: At the root of the search, tablebase results are
+ *   used to filter out losing moves and select the optimal line. If the
+ *   position is a tablebase win, the engine plays the shortest path to
+ *   conversion.
+ * - **Search probing**: Inside the search tree, tablebase hits are used
+ *   to return exact scores and cut entire subtrees, dramatically reducing
+ *   search effort in endgame positions.
+ *
+ * The tablebase path is configured via the UCI `SyzygyPath` option.
+ *
+ * @see Tablebase, TablebaseFallback
+ *
+ * @section infra_uci UCI Protocol
+ *
+ * The UCI module implements the **Universal Chess Interface** protocol,
+ * which is the standard communication interface between chess engines
+ * and graphical user interfaces. The module parses incoming commands,
+ * manages engine options, and formats search output.
+ *
+ * Key supported commands:
+ *
+ * | Command | Description |
+ * |---------|-------------|
+ * | `uci` | Engine identification and option advertisement |
+ * | `isready` / `readyok` | Synchronisation handshake |
+ * | `position` | Set up a position from FEN or startpos + moves |
+ * | `go` | Start searching with time/depth/node constraints |
+ * | `stop` | Interrupt the current search |
+ * | `setoption` | Configure engine parameters (Hash, Threads, etc.) |
+ *
+ * Configurable options:
+ *
+ * | Option | Type | Default | Description |
+ * |--------|------|---------|-------------|
+ * | `Hash` | spin | 64 | Transposition table size (MB) |
+ * | `Threads` | spin | 1 | Number of search threads |
+ * | `SyzygyPath` | string | (empty) | Path to Syzygy tablebase files |
+ * | `MoveOverhead` | spin | 10 | Safety margin for time management (ms) |
+ *
+ * @see UCI, UciOptions
+ *
+ * @section infra_book Opening Book
+ *
+ * An optional **Polyglot-format** opening book can be loaded to play
+ * pre-computed book moves in the opening phase. When a book move is
+ * available, the engine plays it immediately without running the search,
+ * saving time and providing variety in the opening.
+ *
+ * The Polyglot format stores positions as Zobrist hashes with associated
+ * moves and weights, allowing probabilistic move selection for more
+ * varied play. The engine walks the book until no matching position is
+ * found, then switches to its own search.
+ *
+ * @see Polyglot
+ */

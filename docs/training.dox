@@ -1,0 +1,191 @@
+/**
+ * @page training Training
+ *
+ * @tableofcontents
+ *
+ * The Training module is a PyTorch pipeline that trains the Factorized
+ * Mixture-of-Experts neural network from the binary datasets produced by
+ * the Preprocessing module. It uses memory-mapped dataset loaders so that
+ * hundreds of millions of positions can be trained on with minimal RAM
+ * overhead.
+ *
+ * Training is organised into three carefully designed phases that prevent
+ * expert collapse and ensure each expert develops genuine
+ * specialisation for its assigned position type.
+ *
+ * Detailed documentation:
+ *
+ * - @subpage train_phases — Three-phase curriculum for expert specialisation
+ * - @subpage train_infra — Dataset loading, weight export, and experiment tracking
+ *
+ * @section train_files Source Files
+ *
+ * | File | Purpose |
+ * |------|---------|
+ * | `train.py` | Main training loop with multi-phase curriculum |
+ * | `model.py` | Network architecture — Factorized MoE with 1×1 mixer and expert bodies |
+ * | `dataset.py` | Memory-mapped binary dataset with chunked random sampling |
+ * | `loss.py` | Custom loss functions: WDL cross-entropy, eval MSE |
+ * | `export.py` | Converts PyTorch state dict to the engine's flat binary weight format |
+ * | `train.sh` | End-to-end shell script that runs training phases sequentially |
+ * | `utils.py` | Logging, colour-coded console output, and training utilities |
+ *
+ * @section train_quickstart Quick Start
+ *
+ * @code{.sh}
+ * # Run the training pipeline end-to-end
+ * cd training
+ * bash train.sh
+ *
+ * # Or run individual phases manually
+ * python train.py --phase 1 --data_dirs /data/chess
+ * python train.py --phase 2 --data_dirs /data/chess --checkpoint checkpoints/model_base_phase1_final.pt
+ * python train.py --phase 4 --data_dirs /data/chess --checkpoint checkpoints/model_experts_phase2.pt
+ *
+ * # Export trained weights for the C++ engine
+ * python export.py --checkpoint checkpoints/model_finetune_phase4_final.pt --output weights.bin
+ * @endcode
+ */
+
+/**
+ * @page train_phases Multi-Phase Training Curriculum
+ *
+ * @tableofcontents
+ *
+ * In this architecture, routing is **algorithmic and static** — it is computed
+ * during the C++ preprocessing phase rather than by a trainable gating network.
+ * This guarantees stable, predictable routing and eliminates the need for
+ * load-balancing losses during training.
+ *
+ * To build a strong shared representation while allowing experts to specialise,
+ * training is split into three phases.
+ *
+ * @section phase1 Phase 1 — Backbone Pre-Training
+ *
+ * **Goal**: Build a strong shared representation before specialisation.
+ *
+ * In this phase, only the **1×1 mixer**, the **global feature head**, and
+ * a **single shared expert body** are trained. All positions in the dataset
+ * contribute equally, and the algorithmic routing labels are ignored.
+ *
+ * This ensures that the shared layers learn a universal representation of
+ * chess positions. At the end of this phase, the weights of the single trained
+ * expert are copied to initialise all the individual experts for Phase 2.
+ *
+ * | Parameter | Typical value |
+ * |-----------|--------------|
+ * | Epochs | 8-12 |
+ * | Learning rate | 1e-3 (cosine decay) |
+ * | Batch size | 4096 |
+ * | Loss | WDL cross-entropy + eval MSE |
+ *
+ * @section phase2 Phase 2 — Expert Specialisation
+ *
+ * **Goal**: Fine-tune each expert body independently on its assigned subset
+ * of positions.
+ *
+ * The shared backbone (mixer + global features) is **frozen**. The static
+ * routing decisions computed during preprocessing determine which positions
+ * each expert sees during training. Each expert is fine-tuned independently:
+ *
+ * | Expert | Specialisation | Training subset |
+ * |--------|---------------|----------------|
+ * | Expert 0 | **Tactical** | Positions with checks, captures, threats, hanging pieces |
+ * | Expert 1 | **Strategical** | Stable middlegame positions with structural imbalances |
+ * | Expert 2 | **Major-piece endgame** | Rook endings, queen endings, rook+pawn endings |
+ * | Expert 3 | **Minor-piece endgame** | Bishop/knight endings, opposite-colour bishop endings |
+ *
+ * The `ExpertChunkedSampler` in `dataset.py` ensures each expert only
+ * sees positions matching its algorithmic routing label.
+ *
+ * | Parameter | Typical value |
+ * |-----------|--------------|
+ * | Epochs per expert | 5-8 |
+ * | Learning rate | 1e-4 |
+ * | Frozen layers | Mixer, global features |
+ *
+ * @section phase4 Phase 4 — Joint Fine-Tuning (Top-2)
+ *
+ * **Goal**: Joint fine-tuning of the entire network for final convergence.
+ *
+ * All layers — mixer and all experts — are **unfrozen** and trained jointly at
+ * a low learning rate. This allows the components to adapt to each other and
+ * resolve any inconsistencies introduced by the independent phase 2 training.
+ *
+ * The algorithmic router continues to dictate the forward pass routing, but
+ * the entire network's weights are jointly optimized end-to-end.
+ *
+ * | Parameter | Typical value |
+ * |-----------|--------------|
+ * | Epochs | 3-5 |
+ * | Learning rate | 1e-5 (cosine decay) |
+ * | Frozen layers | None |
+ */
+
+/**
+ * @page train_infra Training Infrastructure
+ *
+ * @tableofcontents
+ *
+ * @section train_dataset Dataset Loading
+ *
+ * The `dataset.py` module provides two specialised sampler classes designed
+ * for large-scale training on binary datasets that do not fit in RAM:
+ *
+ * - **ChunkedRandomSampler**: Loads data in large contiguous chunks from
+ *   memory-mapped files, shuffles positions within each chunk, and yields
+ *   mini-batches. RAM usage is proportional to the chunk size (typically
+ *   1-4 GB), not the total dataset size.
+ *
+ * - **ExpertChunkedSampler**: Extends the chunked sampler to filter
+ *   positions by algorithmic expert label, used during Phase 2 to train each
+ *   expert on its assigned subset.
+ *
+ * Both samplers support multi-worker data loading via PyTorch's
+ * `DataLoader` with `num_workers > 0`.
+ *
+ * @section train_loss Loss Functions
+ *
+ * The `loss.py` module defines the training objective:
+ *
+ * | Component | Description |
+ * |-----------|-------------|
+ * | WDL Brier-style MSE | Mean squared error between predicted and target Win/Draw/Loss probabilities |
+ *
+ * @note The network is trained directly to predict Win/Draw/Loss probabilities (which are converted to centipawns internally by the engine during search). Because routing is handled algorithmically during preprocessing, there is no need for a routing or load-balancing loss component during training.
+ *
+ * @section train_export Weight Export
+ *
+ * After training, `export.py` converts the PyTorch state dict into the
+ * engine's flat binary weight format. The export script:
+ *
+ * 1. Loads the checkpoint and extracts all parameter tensors.
+ * 2. Quantises weights where appropriate.
+ * 3. Writes a flat binary file with a simple header + raw weight data.
+ *
+ * The engine loads this file at startup and constructs the native C++
+ * inference graph from the serialised weights.
+ *
+ * @code{.sh}
+ * python export.py --checkpoint checkpoints/model_finetune_phase4_final.pt --output weights.bin
+ * @endcode
+ *
+ * @section train_wandb Experiment Tracking
+ *
+ * Training supports optional **Weights & Biases** integration for logging
+ * loss curves, learning rate schedules, expert utilisation histograms,
+ * and gradient norms. Enable it with the `--wandb` flag:
+ *
+ * @code{.sh}
+ * python train.py --phase 1 --wandb --project io-chess --data_dirs /data/chess
+ * @endcode
+ *
+ * Tracked metrics include:
+ *
+ * | Metric | Description |
+ * |--------|-------------|
+ * | `train/loss` | Total training loss |
+ * | `train/wdl_loss` | WDL cross-entropy component |
+ * | `val/loss` | Validation loss (computed every N steps) |
+ * | `lr` | Current learning rate |
+ */

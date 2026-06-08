@@ -1,0 +1,114 @@
+# MoE Double-Accumulator Model (ASCII)
+
+This diagram explains the model used by `benchmark_factorized_moe_cache.cpp`.
+
+```text
+                        FACTORIZED INPUT (per position)
+            +-----------------------------------------------+
+            | branches[12][up to 5][64]  bypass[12][64]    |
+            | global[21]                                    |
+            +---------------------------+-------------------+
+                                        |
+                                        v
+        +------------------------------------------------------------------+
+        |                    12 BRANCH HEADS (piece groups)                |
+        |                                                                  |
+        |   Branch b0      Branch b1                 ...          Branch b11|
+        |   ----------     ----------                             ---------- |
+        |   l0: 3x3 ReLU   l0: 3x3 ReLU                          l0: 3x3 ReLU
+        |   l1: 3x3 ReLU   l1: 3x3 ReLU          (or 1/2 layers via CLI)   |
+        |   l2: 1x1 ReLU   l2: 1x1 ReLU                          l2: 1x1 ReLU
+        +-----------+-----------+--------------------------------------+-----+
+                    |                                                  |
+                    +-------------------- branchCache -----------------+
+                              shape: [12][branch_dim][64]
+                                        |
+                                        v
+        +------------------------------------------------------------------+
+        |                     MIXER LINEAR ACCUMULATOR                     |
+        |                                                                  |
+        | mixerLinearAccum[oc][sq] = mixerB[oc]                            |
+        |                          + sum_b,c( branchCache[b][c][sq] * WBr )|
+        |                          + sum_bp( bypass[bp][sq] * WBp )        |
+        +--------------------------------------+---------------------------+
+                                               |
+                                +--------------+--------------+
+                                | global projection per oc:   |
+                                | gproj[oc] = globalB[oc] +   |
+                                |            dot(globalW[oc], |
+                                |                global[ ])    |
+                                +--------------+--------------+
+                                               |
+                                               v
+        +------------------------------------------------------------------+
+        |                     POST-RELU MIXER CACHE                         |
+        | mixerReluCache[oc][sq] = ReLU(mixerLinearAccum[oc][sq] + gproj)  |
+        +------------------------------+-----------------------------------+
+                                       |
+                                       v
+        +------------------------------------------------------------------+
+        |                ROUTER (Top-2 experts from global)                |
+        | score[e] = gateB[e] + dot(gateW[e], global)                      |
+        | pick top-2 (e0,e1), softmax over 2 => weights (w0,w1)            |
+        +------------------------------+-----------------------------------+
+                                       |
+                    +------------------+------------------+
+                    |                                     |
+                    v                                     v
+        +-------------------------------+     +-------------------------------+
+        | Expert e0 cache/state         |     | Expert e1 cache/state         |
+        |-------------------------------|     |-------------------------------|
+        | exPreAccum[ebo][64]           |     | exPreAccum[ebo][64]           |
+        | exReluCache[ebo][64]          |     | exReluCache[ebo][64]          |
+        | hiddenAcc[eh]                 |     | hiddenAcc[eh]                 |
+        +---------------+---------------+     +---------------+---------------+
+                        |                                     |
+                        v                                     v
+             run_active_expert(e0)                 run_active_expert(e1)
+             - hidden = ReLU(hiddenAcc)            - hidden = ReLU(hiddenAcc)
+             - wdl logits -> softmax(3)            - wdl logits -> softmax(3)
+             - mate logit -> sigmoid               - mate logit -> sigmoid
+                        |                                     |
+                        +------------------+------------------+
+                                           |
+                                           v
+                      final_wdl = w0*wdl0 + w1*wdl1
+                      final_mate = w0*m0   + w1*m1
+```
+
+## Full rebuild path
+
+```text
+all 12 branches -> rebuild mixerLinearAccum -> rebuild mixerReluCache
+-> rebuild caches for active Top-2 experts -> run Top-2 heads
+```
+
+## Incremental path
+
+```text
+dirty branches only
+  -> recompute dirty branch outputs
+  -> apply branch deltas to mixerLinearAccum
+
+bypass deltas
+  -> apply bypass deltas to mixerLinearAccum
+
+global delta
+  -> if changed, all squares become dirty for ReLU/global update
+
+dirty square update
+  -> update mixerReluCache only on dirty squares
+  -> compute deltaRelu
+
+active Top-2 experts only
+  -> update exPreAccum / exReluCache from deltaRelu
+  -> update hiddenAcc with flat delta (dense or sparse mode)
+  -> run Top-2 heads
+```
+
+## Runtime tuning flags
+
+- `--min-parallel-dirty-heads`: minimum dirty branches before parallel branch recompute.
+- `--dense-dirty-threshold`: minimum dirty squares before switching to dense (all-64) expert-delta loops.
+- `--threads`: worker count for persistent thread pool.
+- `--branch-conv-layers`: branch depth (1, 2, or 3).

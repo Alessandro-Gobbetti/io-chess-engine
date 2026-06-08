@@ -1,9 +1,15 @@
+/**
+ * @file polyglot_book.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "polyglot_book.hpp"
 #include "polyglot_keys.hpp"
 #include <algorithm>
 #include <bit>
 #include <fstream>
 #include <iostream>
+#include <random>
 
 // Helper for endian swap
 #if defined(_MSC_VER)
@@ -102,11 +108,11 @@ uint64_t PolyglotBook::compute_polyglot_key(const chess::Board &board) const {
     Square ep_sq = board.enpassantSq();
     File ep_file = ep_sq.file();
 
+    // Polyglot: include en-passant file only if the side to move has
+    // at least one pawn that can capture on the ep square.
     Color us = board.sideToMove();
-    Color them = ~us;
-    Bitboard enemy_pawns = board.pieces(PieceType::PAWN, them);
-
-    Bitboard attackers = attacks::pawn(us, ep_sq) & enemy_pawns;
+    Bitboard our_pawns = board.pieces(PieceType::PAWN, us);
+    Bitboard attackers = attacks::pawn(~us, ep_sq) & our_pawns;
 
     if (attackers) {
       key ^= Polyglot::Random64[772 + static_cast<int>(ep_file)];
@@ -195,42 +201,75 @@ chess::Move PolyglotBook::probe(const chess::Board &board,
     return chess::Move::NULL_MOVE;
   }
 
+  struct Candidate {
+    chess::Move move;
+    uint16_t weight;
+  };
+
+  std::vector<Candidate> candidates;
+  candidates.reserve(matches.size());
+  size_t invalidCount = 0;
+  for (const auto &entry : matches) {
+    const chess::Move move = polyglot_to_move(bswap_16(entry.move), board);
+    if (move != chess::Move::NULL_MOVE) {
+      candidates.push_back({move, bswap_16(entry.weight)});
+    } else {
+      ++invalidCount;
+    }
+  }
+
+  if (candidates.empty()) {
+    if (invalidCount > 0) {
+      std::cout << "info string " << bookName
+                << " has only invalid entries for this position (" << invalidCount
+                << "), falling back to search" << std::endl;
+    }
+    return chess::Move::NULL_MOVE;
+  }
+
   // Print all book moves with weights
   std::cout << "info string " << bookName << " candidates:";
-  for (const auto &entry : matches) {
-    chess::Move move = polyglot_to_move(bswap_16(entry.move), board);
-    std::string uci_str = chess::uci::moveToUci(move);
-    uint16_t weight = bswap_16(entry.weight);
+  for (const auto &candidate : candidates) {
+    std::string uci_str = chess::uci::moveToUci(candidate.move);
+    uint16_t weight = candidate.weight;
     std::cout << " " << uci_str << "(" << weight << ")";
+  }
+  if (invalidCount > 0) {
+    std::cout << " [invalid:" << invalidCount << "]";
   }
   std::cout << std::endl;
 
   // Weighted random selection
   uint32_t total_weight = 0;
-  for (const auto &entry : matches) {
-    total_weight += bswap_16(entry.weight);
+  for (const auto &candidate : candidates) {
+    total_weight += candidate.weight;
   }
 
-  if (total_weight == 0) { // Should not happen with good books
-    chess::Move move = polyglot_to_move(bswap_16(matches[0].move), board);
+  static thread_local std::mt19937 rng(std::random_device{}());
+
+  if (total_weight == 0) {
+    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+    chess::Move move = candidates[dist(rng)].move;
     std::cout << "info string " << bookName
               << " selected: " << chess::uci::moveToUci(move)
-              << " (only option)" << std::endl;
+              << " (uniform, zero weights)" << std::endl;
     return move;
   }
 
-  uint32_t pick = rand() % total_weight;
+  std::uniform_int_distribution<uint32_t> dist(0, total_weight - 1);
+  uint32_t pick = dist(rng);
 
   uint32_t current_sum = 0;
-  for (const auto &entry : matches) {
-    current_sum += bswap_16(entry.weight);
+  for (const auto &candidate : candidates) {
+    current_sum += candidate.weight;
     if (current_sum > pick) {
-      chess::Move move = polyglot_to_move(bswap_16(entry.move), board);
+      chess::Move move = candidate.move;
       std::cout << "info string " << bookName
                 << " selected: " << chess::uci::moveToUci(move) << std::endl;
       return move;
     }
   }
 
-  return chess::Move::NULL_MOVE;
+  // Numerical fallback (should be unreachable): pick the first legal move.
+  return candidates.front().move;
 }

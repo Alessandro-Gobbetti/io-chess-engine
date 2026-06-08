@@ -1,0 +1,191 @@
+/**
+ * @page data Data Pipeline
+ *
+ * @tableofcontents
+ *
+ * The Data Pipeline provides utilities for acquiring, filtering, and
+ * shuffling the chess evaluation dataset used by the Preprocessing and
+ * Training modules. All tools are designed for out-of-core operation
+ * and can handle datasets that exceed available RAM.
+ *
+ * @section data_overview Overview
+ *
+ * The data flow proceeds in two stages:
+ *
+ * @code{.unparsed}
+ *   ┌────────────────────────┐     ┌─────────────────────┐
+ *   │  Download & Filter     │────▶│      Shuffle         │
+ *   │  prepare_dataset.py    │     │  shuffle_dataset.sh  │
+ *   │  (HuggingFace → CSV)  │     │  (parallel, seeded)  │
+ *   └────────────────────────┘     └─────────────────────┘
+ * @endcode
+ *
+ * - @subpage data_prepare — Downloading and filtering the dataset
+ * - @subpage data_shuffle — Parallel out-of-core shuffling for training
+ *
+ * @section data_dir Directory Layout
+ *
+ * @code{.unparsed}
+ * data/
+ * ├── prepare_dataset.py     # Download, filter, and export to CSV
+ * ├── shuffle_dataset.sh     # Parallel out-of-core shuffling
+ * ├── depth_histogram.png    # Evaluation depth distribution (generated)
+ * └── processed/             # Cached/processed dataset artifacts
+ * @endcode
+ *
+ * @section data_dataset Dataset
+ *
+ * The project uses the
+ * **[mateuszgrzyb/lichess-stockfish-normalized](https://huggingface.co/datasets/mateuszgrzyb/lichess-stockfish-normalized)**
+ * dataset hosted on HuggingFace. This dataset contains millions of chess
+ * positions from Lichess games, each annotated with a Stockfish evaluation
+ * at varying search depths.
+ *
+ * | Field | Type | Description |
+ * |-------|------|-------------|
+ * | `fen` | string | Board position in Forsyth-Edwards Notation |
+ * | `cp` | int / null | Stockfish centipawn evaluation (null if mate) |
+ * | `mate` | int / null | Mate-in-N score (null if not a forced mate) |
+ * | `depth` | int | Stockfish search depth used for the evaluation |
+ *
+ * The dataset is loaded via the HuggingFace `datasets` library using
+ * **memory-mapped** access, meaning the full dataset is never loaded
+ * into RAM at once.
+ */
+
+/**
+ * @page data_prepare Downloading and Filtering
+ *
+ * @tableofcontents
+ *
+ * @section prep_ds_overview Overview
+ *
+ * `prepare_dataset.py` is a Python script that handles both **downloading**
+ * and **filtering** the chess evaluation dataset in a single pass. It
+ * streams the dataset from HuggingFace, applies quality filters, and
+ * writes the result to a clean CSV file ready for the preprocessing
+ * pipeline.
+ *
+ * @section prep_ds_source Data Source
+ *
+ * The script downloads the
+ * `mateuszgrzyb/lichess-stockfish-normalized` dataset from HuggingFace
+ * using the `datasets` library:
+ *
+ * @code{.py}
+ * dataset = load_dataset("mateuszgrzyb/lichess-stockfish-normalized", split="train")
+ * @endcode
+ *
+ * The HuggingFace library caches the dataset locally after the first
+ * download (~50 GB compressed), so subsequent runs skip the download
+ * step entirely.
+ *
+ * @section prep_ds_filtering Filtering
+ *
+ * The script applies the following quality filters during processing:
+ *
+ * | Filter | Condition | Rationale |
+ * |--------|-----------|-----------|
+ * | **Minimum depth** | `depth > 10` | Shallow evaluations are unreliable and add noise to training |
+ *
+ * Positions with a **mate score** (`mate` field is not null) are retained
+ * and formatted as `#N` (e.g. `#3` for mate-in-3). All other positions
+ * use the raw centipawn value.
+ *
+ * @section prep_ds_output Output Format
+ *
+ * The script writes a two-column CSV file:
+ *
+ * @code{.unparsed}
+ * fen,eval
+ * rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1,35
+ * r1bqkb1r/pppppppp/2n2n2/8/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3,52
+ * ...
+ * @endcode
+ *
+ * This CSV is the input for the C++ preprocessing binary which converts
+ * the FEN strings into packed binary feature datasets.
+ *
+ * @section prep_ds_histogram Depth Distribution
+ *
+ * After processing, the script generates a histogram
+ * (`depth_histogram.png`) showing the distribution of evaluation depths
+ * across the filtered dataset. This helps verify that shallow evaluations
+ * were correctly removed and that the remaining data has sufficient depth.
+ *
+ * @section prep_ds_usage Usage
+ *
+ * @code{.sh}
+ * # Install dependencies
+ * pip install datasets tqdm matplotlib
+ *
+ * # Run the script (downloads on first run, ~50 GB)
+ * cd data
+ * python prepare_dataset.py
+ *
+ * # Output: chess_dataset.csv + depth_histogram.png
+ * @endcode
+ *
+ * @section prep_ds_memory Memory Efficiency
+ *
+ * The script processes the dataset in batches of 100,000 rows using
+ * `dataset.iter(batch_size=100_000)`, which iterates over the
+ * memory-mapped file without loading the entire dataset into RAM.
+ * Each batch is filtered, formatted, and flushed to disk immediately,
+ * keeping memory usage constant at approximately 200-400 MB regardless
+ * of dataset size.
+ */
+
+/**
+ * @page data_shuffle Shuffling
+ *
+ * @tableofcontents
+ *
+ * @section shuf_overview Overview
+ *
+ * `shuffle_dataset.sh` is a Bash script that performs high-performance,
+ * **seeded** shuffling of multi-gigabyte CSV files. Training on
+ * sequentially ordered data (positions from the same game grouped
+ * together) leads to poor convergence, so thorough shuffling is essential
+ * before feeding data to the preprocessing pipeline.
+ *
+ * @section shuf_algorithm Algorithm
+ *
+ * The script uses a pipeline approach that keeps memory usage bounded:
+ *
+ * 1. **Extract** the CSV header and write it to the output file.
+ * 2. **Prepend** a random key to each row using `awk` with a fixed seed
+ *    for reproducibility.
+ * 3. **Sort** by the random key using GNU `sort` with multi-threaded
+ *    parallel merge (`--parallel`) and bounded RAM (`-S`).
+ * 4. **Strip** the random key prefix using `cut`.
+ *
+ * Progress is tracked via `pv` (pipe viewer), which displays throughput
+ * and a progress bar based on the total line count.
+ *
+ * @section shuf_config Configuration
+ *
+ * The following parameters can be edited at the top of the script:
+ *
+ * | Parameter | Default | Description |
+ * |-----------|---------|-------------|
+ * | `INPUT` | `chess_dataset.csv` | Path to the input CSV file |
+ * | `OUTPUT` | `shuffled.csv` | Path to the output shuffled CSV |
+ * | `SEED` | `42` | Random seed for reproducible shuffling |
+ * | `CORES` | `4` | Number of parallel sort threads |
+ * | `RAM` | `4G` | Maximum RAM for the sort buffer |
+ * | `TMP_DIR` | `.` | Directory for temporary sort files |
+ *
+ * @section shuf_usage Usage
+ *
+ * @code{.sh}
+ * cd data
+ * bash shuffle_dataset.sh
+ *
+ * # Output: shuffled.csv
+ * @endcode
+ *
+ * @note The progress bar will reach 100% and then appear to "pause" while
+ * GNU `sort` performs its final merge pass. This is normal — do not cancel
+ * the script at this point.
+ */

@@ -1,0 +1,112 @@
+/**
+ * @mainpage io-chess — UCI Chess Engine
+ *
+ * @tableofcontents
+ *
+ * @section intro Introduction
+ *
+ * **io-chess** is a UCI-compatible chess engine written in modern C++20.
+ * It combines a high-performance alpha-beta search with a natively-compiled
+ * **Factorized Mixture-of-Experts (MoE)** neural network for position
+ * evaluation, achieving competitive play without any runtime dependency on
+ * ONNX or other ML frameworks.
+ *
+ * The engine is designed end-to-end: from raw game data all the way to a
+ * self-contained binary that speaks the Universal Chess Interface (UCI)
+ * protocol and can be plugged into any compatible GUI — Arena, CuteChess,
+ * Lichess-bot, or the command line.
+ *
+ * @section highlights Key Features
+ *
+ * | Category | Feature |
+ * |----------|---------|
+ * | **Search** | Iterative deepening, PVS, aspiration windows, Lazy SMP |
+ * | **Pruning** | Null-move, LMR, futility, reverse futility, singular extensions |
+ * | **Evaluation** | Factorized MoE neural net with incremental updates |
+ * | **Endgame** | Syzygy tablebase probing (up to 6 pieces) |
+ * | **Opening** | Polyglot-format opening book support |
+ * | **Platform** | Linux, macOS; x86-64 with SSE/AVX, Apple Silicon |
+ *
+ * @section project_structure Project Structure
+ *
+ * The project is organised into four major modules, each documented in
+ * its own section:
+ *
+ * - @subpage engine — The core C++ chess engine: search, evaluation, UCI
+ *   protocol, tablebases, and opening book.
+ * - @subpage preprocessing — C++ pipeline that extracts spatial features
+ *   from millions of chess positions and writes them to compact binary
+ *   datasets.
+ * - @subpage training — PyTorch training pipeline for the Factorized MoE
+ *   network, including multi-phase expert specialisation and weight export.
+ * - @subpage data — Python and shell utilities for downloading, filtering,
+ *   and shuffling the Lichess evaluation dataset from HuggingFace.
+ *
+ * @section arch Architecture Overview
+ *
+ * The full pipeline flows from raw game data to a self-contained engine
+ * binary:
+ *
+ * @code{.unparsed}
+ *
+ *   HuggingFace Dataset
+ *         │
+ *         ▼
+ *   ┌─────────────────┐     ┌──────────────────────┐     ┌───────────────────┐
+ *   │  Data Pipeline  │     │    Preprocessing     │     │     Training      │
+ *   │ prepare_dataset │────▶│  FactorizedFeature-  │────▶│  train.py         │
+ *   │ shuffle_dataset │     │  Extractor (C++)     │     │  model.py (MoE)   │
+ *   │                 │     │  → packed .bin files │     │  loss.py          │
+ *   └─────────────────┘     └──────────────────────┘     └────────┬──────────┘
+ *                                                                 │
+ *                                                         export.py (weights)
+ *                                                                 │
+ *                                                                 ▼
+ *                                                        ┌───────────────────┐
+ *                                                        │      Engine       │
+ *                                                        │  Negamax + PVS    │
+ *                                                        │  Native MoE eval  │
+ *                                                        │  UCI interface    │
+ *                                                        └───────────────────┘
+ *
+ * @endcode
+ *
+ * @section build Building the Engine
+ *
+ * @subsection build_prereqs Prerequisites
+ *
+ * - A C++20 compiler (GCC ≥ 12, Clang ≥ 15, or Apple Clang ≥ 14)
+ * - CMake ≥ 3.20
+ * - (Optional) Syzygy tablebases for endgame probing
+ * - (Optional) Python ≥ 3.10 with PyTorch for training
+ *
+ * @subsection build_steps Compilation
+ *
+ * @code{.sh}
+ * cd engine
+ * mkdir build && cd build
+ * cmake .. -DCMAKE_BUILD_TYPE=Release
+ * make -j$(nproc)
+ * @endcode
+ *
+ * The resulting binary `io-chess` can be used directly with any UCI-compatible
+ * chess GUI.
+ *
+ * @subsection build_uci Quick UCI Test
+ *
+ * @code{.sh}
+ * ./io-chess
+ * # Type the following UCI commands:
+ * uci
+ * isready
+ * position startpos moves e2e4 e7e5
+ * go depth 15
+ * @endcode
+ *
+ * @section license License
+ *
+ * This project is developed as part of a university research initiative.
+ * See the repository for licensing details.
+ *
+ * Source code: https://github.com/Alessandro-Gobbetti/io-chess-engine
+ */

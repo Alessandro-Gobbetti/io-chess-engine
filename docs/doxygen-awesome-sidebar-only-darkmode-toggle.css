@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: MIT */
+/**
+
+Doxygen Awesome
+https://github.com/jothepro/doxygen-awesome-css
+
+Copyright (c) 2021 - 2025 jothepro
+
+*/
+
+@media screen and (min-width: 768px) {
+    .tabs #MSearchBox {
+        position: absolute;
+        left: var(--spacing-medium) !important;
+        right: auto !important;
+        width: calc(var(--side-nav-fixed-width) - calc(2 * var(--spacing-medium)) - var(--searchbar-height) - 8px) !important;
+    }
+
+    #MSearchField {
+        width: calc(100% - 64px) !important;
+    }
+
+    doxygen-awesome-dark-mode-toggle {
+        position: absolute !important;
+        right: var(--spacing-medium) !important;
+        left: auto !important;
+        top: calc(calc(var(--searchbar-height) / 2) + 2px) !important;
+        transform: translateY(-50%) !important;
+        margin: 0 !important;
+        width: var(--searchbar-height) !important;
+        height: var(--searchbar-height) !important;
+    }
+}

@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1120" viewBox="0 0 1900 1120" role="img" aria-labelledby="title desc">
+  <title id="title">ChessNetFactorizedMoE architecture</title>
+  <desc id="desc">Detailed SVG diagram of ChessNetFactorizedMoE showing branch towers, mixer, global injection, experts, and output heads with tensor shapes.</desc>
+
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill:#f8fafc; }
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill:#0f172a; }
+      .subtitle { font: 500 17px Arial, Helvetica, sans-serif; fill:#334155; }
+      .section { font: 700 18px Arial, Helvetica, sans-serif; fill:#0f172a; }
+      .box-title { font: 700 15px Arial, Helvetica, sans-serif; fill:#0f172a; }
+      .box-text { font: 500 13px Arial, Helvetica, sans-serif; fill:#1e293b; }
+      .small { font: 500 12px Arial, Helvetica, sans-serif; fill:#334155; }
+      .box { fill:#ffffff; stroke:#334155; stroke-width:1.5; rx:12; ry:12; }
+      .box-soft { fill:#eef2ff; stroke:#3730a3; stroke-width:1.5; rx:12; ry:12; }
+      .box-aux { fill:#ecfeff; stroke:#0e7490; stroke-width:1.5; rx:12; ry:12; }
+      .box-expert { fill:#fef9c3; stroke:#a16207; stroke-width:1.5; rx:12; ry:12; }
+      .box-output { fill:#dcfce7; stroke:#166534; stroke-width:1.5; rx:12; ry:12; }
+      .line { stroke:#334155; stroke-width:2.3; fill:none; marker-end:url(#arrow); }
+      .line-dashed { stroke:#334155; stroke-width:2; fill:none; stroke-dasharray:8 6; marker-end:url(#arrow); }
+      .chip { fill:#e2e8f0; stroke:#64748b; stroke-width:1; rx:9; ry:9; }
+      .chip-text { font: 600 12px Arial, Helvetica, sans-serif; fill:#1e293b; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1900" height="1120"/>
+
+  <text class="title" x="48" y="62">ChessNetFactorizedMoE: Layer and Tensor Architecture</text>
+  <text class="subtitle" x="48" y="92">Source: training/model_light_moe.py | Class: ChessNetFactorizedMoE</text>
+
+  <rect class="chip" x="48" y="116" width="165" height="30"/>
+  <text class="chip-text" x="62" y="136">in_channels = C</text>
+  <rect class="chip" x="224" y="116" width="164" height="30"/>
+  <text class="chip-text" x="238" y="136">branch_dim = D</text>
+  <rect class="chip" x="398" y="116" width="147" height="30"/>
+  <text class="chip-text" x="412" y="136">n_bypass = BYP</text>
+  <rect class="chip" x="555" y="116" width="145" height="30"/>
+  <text class="chip-text" x="569" y="136">n_filters = F</text>
+  <rect class="chip" x="710" y="116" width="150" height="30"/>
+  <text class="chip-text" x="724" y="136">n_globals = G</text>
+  <rect class="chip" x="870" y="116" width="210" height="30"/>
+  <text class="chip-text" x="884" y="136">experts = 4 (current)</text>
+
+  <text class="section" x="48" y="188">Main Forward Path</text>
+
+  <rect class="box" x="48" y="210" width="250" height="140"/>
+  <text class="box-title" x="66" y="235">Input: planes_list</text>
+  <text class="box-text" x="66" y="257">12 tensors (piece groups)</text>
+  <text class="box-text" x="66" y="277">Each: [B, C, 8, 8]</text>
+  <text class="box-text" x="66" y="297">Examples:</text>
+  <text class="small" x="82" y="317">group 0: white pawns</text>
+  <text class="small" x="82" y="333">group 11: black king</text>
+
+  <rect class="box-soft" x="350" y="190" width="360" height="180"/>
+  <text class="box-title" x="370" y="216">12 x DeepPieceBranch (independent towers)</text>
+  <text class="box-text" x="370" y="240">Input per branch: [B, C, 8, 8]</text>
+  <text class="box-text" x="370" y="262">1) Conv3x3: C -&gt; D, bias=False</text>
+  <text class="box-text" x="370" y="282">2) BatchNorm2d(D)</text>
+  <text class="box-text" x="370" y="302">3) ReLU</text>
+  <text class="box-text" x="370" y="322">4) Conv3x3: D -&gt; D, bias=False</text>
+  <text class="box-text" x="370" y="342">5) BatchNorm2d(D) + ReLU</text>
+  <text class="box-text" x="370" y="362">6) Conv1x1: D -&gt; D, bias=False + BN + ReLU</text>
+
+  <rect class="box" x="770" y="235" width="240" height="90"/>
+  <text class="box-title" x="790" y="260">Concat branch outputs</text>
+  <text class="box-text" x="790" y="282">Shape: [B, 12D, 8, 8]</text>
+
+  <rect class="box" x="1060" y="210" width="250" height="80"/>
+  <text class="box-title" x="1080" y="235">Input: bypass_planes</text>
+  <text class="box-text" x="1080" y="257">[B, BYP, 8, 8]</text>
+
+  <rect class="box" x="1060" y="310" width="280" height="90"/>
+  <text class="box-title" x="1080" y="335">Concat with bypass</text>
+  <text class="box-text" x="1080" y="357">Shape: [B, 12D + BYP, 8, 8]</text>
+
+  <rect class="box-soft" x="1390" y="290" width="290" height="140"/>
+  <text class="box-title" x="1410" y="315">Pointwise Mixer</text>
+  <text class="box-text" x="1410" y="337">Conv1x1: (12D+BYP) -&gt; F, bias=False</text>
+  <text class="box-text" x="1410" y="359">BatchNorm2d(F)</text>
+  <text class="box-text" x="1410" y="381">ReLU</text>
+  <text class="box-text" x="1410" y="403">Output: [B, F, 8, 8]</text>
+
+  <rect class="box-aux" x="1390" y="120" width="290" height="140"/>
+  <text class="box-title" x="1410" y="145">Global Injection Path</text>
+  <text class="box-text" x="1410" y="167">Input global_v: [B, G]</text>
+  <text class="box-text" x="1410" y="189">Linear: G -&gt; F, bias=False</text>
+  <text class="box-text" x="1410" y="211">BatchNorm1d(F)</text>
+  <text class="box-text" x="1410" y="233">Reshape to [B, F, 1, 1]</text>
+
+  <rect class="box" x="1730" y="290" width="140" height="100"/>
+  <text class="box-title" x="1748" y="317">Fuse</text>
+  <text class="box-text" x="1748" y="339">Add</text>
+  <text class="box-text" x="1748" y="359">+ ReLU</text>
+
+  <rect class="box" x="1670" y="430" width="220" height="80"/>
+  <text class="box-title" x="1688" y="455">Shared feature map</text>
+  <text class="box-text" x="1688" y="477">[B, F, 8, 8]</text>
+
+  <text class="section" x="48" y="548">Expert Heads and Output Combination</text>
+
+  <rect class="box-expert" x="340" y="580" width="330" height="200"/>
+  <text class="box-title" x="360" y="607">LightExpert (x4 experts)</text>
+  <text class="box-text" x="360" y="631">Input: [B, F, 8, 8]</text>
+  <text class="box-text" x="360" y="653">1) Conv1x1: F -&gt; 32, bias=True + ReLU</text>
+  <text class="box-text" x="360" y="675">2) Flatten: [B, 32*8*8] = [B, 2048]</text>
+  <text class="box-text" x="360" y="697">3) Linear: 2048 -&gt; 128, bias=True + ReLU</text>
+  <text class="box-text" x="360" y="719">4) WDL head: Linear 128 -&gt; 3 + softmax</text>
+  <text class="box-text" x="360" y="741">5) Mate head: Linear 128 -&gt; 1 + sigmoid</text>
+
+  <rect class="box" x="740" y="620" width="290" height="130"/>
+  <text class="box-title" x="760" y="647">Per-expert outputs</text>
+  <text class="box-text" x="760" y="670">wdl_i: [B, 3]</text>
+  <text class="box-text" x="760" y="692">mate_i: [B, 1]</text>
+  <text class="box-text" x="760" y="714">for i in {0,1,2,3}</text>
+
+  <rect class="box" x="1080" y="620" width="310" height="140"/>
+  <text class="box-title" x="1100" y="647">Combination</text>
+  <text class="box-text" x="1100" y="670">If expert_weights is None:</text>
+  <text class="box-text" x="1100" y="692">mean over 4 experts</text>
+  <text class="box-text" x="1100" y="714">Else with [B,4] weights:</text>
+  <text class="box-text" x="1100" y="736">weighted sum over experts</text>
+
+  <rect class="box-output" x="1440" y="620" width="190" height="70"/>
+  <text class="box-title" x="1460" y="647">Final WDL</text>
+  <text class="box-text" x="1460" y="668">[B, 3]</text>
+
+  <rect class="box-output" x="1440" y="710" width="190" height="70"/>
+  <text class="box-title" x="1460" y="737">Final Mate</text>
+  <text class="box-text" x="1460" y="758">[B, 1]</text>
+
+  <text class="section" x="48" y="846">Current Typical Config (for this repo)</text>
+
+  <rect class="box" x="48" y="870" width="880" height="190"/>
+  <text class="box-text" x="70" y="900">Defaults: C=4, D=16, BYP=2, F=64, G=15, experts=4</text>
+  <text class="box-text" x="70" y="926">Rich setup often used here: C=5, D=16, BYP=12, F=64, G=21, experts=4</text>
+  <text class="box-text" x="70" y="952">For rich setup (C=5,BYP=12): total params about 1,114,640</text>
+  <text class="box-text" x="70" y="978">- Experts about 1,059,472 (about 95.05 percent)</text>
+  <text class="box-text" x="70" y="1004">- Branches about 40,512 (about 3.63 percent)</text>
+  <text class="box-text" x="70" y="1030">- Mixer+global about 14,656 (about 1.31 percent)</text>
+
+  <rect class="box" x="970" y="870" width="880" height="190"/>
+  <text class="box-text" x="992" y="900">Key slimming levers:</text>
+  <text class="box-text" x="992" y="926">1) Reduce expert hidden width (strongest effect on params and MACs)</text>
+  <text class="box-text" x="992" y="952">2) Reduce number of experts (4 -&gt; 3 or 2)</text>
+  <text class="box-text" x="992" y="978">3) Reduce branch_dim D (affects branch and mixer width)</text>
+  <text class="box-text" x="992" y="1004">4) Reduce branch depth (for example remove one 3x3 stage)</text>
+
+  <line class="line" x1="298" y1="280" x2="350" y2="280"/>
+  <line class="line" x1="710" y1="280" x2="770" y2="280"/>
+  <line class="line" x1="1010" y1="280" x2="1060" y2="355"/>
+  <line class="line" x1="1310" y1="355" x2="1390" y2="360"/>
+  <line class="line" x1="1680" y1="360" x2="1730" y2="340"/>
+  <line class="line" x1="1800" y1="390" x2="1780" y2="430"/>
+
+  <line class="line" x1="1310" y1="250" x2="1390" y2="190"/>
+  <line class="line" x1="1680" y1="220" x2="1800" y2="290"/>
+
+  <line class="line-dashed" x1="1780" y1="510" x2="505" y2="580"/>
+  <line class="line" x1="670" y1="680" x2="740" y2="680"/>
+  <line class="line" x1="1030" y1="685" x2="1080" y2="685"/>
+  <line class="line" x1="1390" y1="655" x2="1440" y2="655"/>
+  <line class="line" x1="1390" y1="725" x2="1440" y2="745"/>
+
+  <text class="small" x="70" y="1088">Diagram intent: design and modification planning for ChessNetFactorizedMoE (less layers, smaller experts, fewer experts, smaller widths).</text>
+</svg>
