@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/io-chess-icon-text.svg" alt="io-chess logo" width="150" height="150">
+
 # io-chess
 
 <a href="https://lichess.org/@/io-bot"><img src="https://better-shields.ale-gobbetti-personal.workers.dev/badge/Lichess-@io--bot-white?style=for-the-badge-rounded&logo=lichess&logoColor=white&animation2=rainbow" alt="Lichess Bot"></a>
@@ -14,60 +16,66 @@
 
 <br />
 
-[**Challenge on Lichess**](https://lichess.org/@/io-bot) &nbsp;&nbsp;•&nbsp;&nbsp; [**Official Website**](#)
+[**Challenge on Lichess**](https://lichess.org/@/io-bot) &nbsp;&nbsp;•&nbsp;&nbsp; [**Documentation**](https://alessandro-gobbetti.github.io/io-chess-engine/)
 
 </div>
 
 <br/>
 
-**io-chess** is a custom UCI-compatible chess engine written in C++20. The evaluation relies on an ONNX-backed Mixture of Experts (MoE) neural network alongside a custom alpha-beta search implementation. The engine compiles natively for Linux/macOS and provides a WebAssembly target for browser execution.
+**io-chess** is a UCI-compatible chess engine written in modern C++20. It combines a high-performance alpha-beta search with a natively-compiled **Factorized Mixture-of-Experts (MoE)** neural network for position evaluation, achieving competitive play **without any runtime dependency on ONNX or other ML frameworks**.
 
-## Architecture Overview
+## Project Structure
+
+The project is designed end-to-end, spanning data acquisition, feature extraction, neural network training, and the final engine binary. It is divided into four major modules:
+
+*   **[Engine](engine/)**: The core C++ chess engine featuring Negamax search with PVS, Lazy SMP multi-threading, Syzygy tablebase support, Polyglot opening books, and the natively-compiled MoE evaluation.
+*   **[Preprocessing](preprocessing/)**: A high-performance C++ pipeline that extracts spatial features from millions of chess positions and writes them to compact binary datasets.
+*   **[Training](training/)**: A PyTorch training pipeline for the Factorized MoE network, implementing a multi-phase curriculum for expert specialization and weight export.
+*   **[Data](data/)**: Python and shell utilities for downloading, filtering, and shuffling the HuggingFace evaluation dataset.
+
+For a comprehensive overview of the architecture, please refer to the [Documentation](docs/).
+
+## Architecture Highlights
 
 ### Search
-The search function uses a Principal Variation Search (PVS) with Iterative Deepening. Threading is handled via Lazy SMP for parallel node evaluation. Standard search techniques include:
-*   **Extensions**: Singular Extensions, Check Extensions.
-*   **Reductions & Pruning**: Null Move Pruning (NMP), Late Move Reductions (LMR), ProbCut, Futility Pruning, and Reverse Futility Pruning.
-*   **Move Ordering**: Hash move priority, MVV-LVA, History, and Continuation History heuristics.
-*   **Data Structures**: Shared Transposition Table, Syzygy Endgame Tablebases support.
+The search relies on Principal Variation Search (PVS) with Iterative Deepening.
+*   **Parallelism**: Lock-free Lazy SMP for multi-threaded node evaluation.
+*   **Pruning & Reductions**: Null Move Pruning (NMP), Late Move Reductions (LMR), Futility Pruning, Reverse Futility Pruning, Delta Pruning, and Singular Extensions.
+*   **Move Ordering**: Hash move priority, winning captures (SEE), Killer moves, Counter moves, and History heuristics.
+*   **Endgame & Openings**: Syzygy Endgame Tablebases probing (up to 6 pieces) and Polyglot-format opening book support.
 
 ### Evaluation
-The engine implements two evaluation Contexts:
-*   **Neural Evaluation**: An ONNX-integrated Mixture of Experts (MoE) network taking input from a custom bitboard feature extractor. 
-*   **Heuristic Fallback**: A traditional static evaluation relying on PeSTO Piece-Square Tables with game-phase interpolation.
+*   **Factorized MoE Neural Network**: The primary evaluator is a Factorized Mixture-of-Experts network trained on hundreds of millions of positions. It uses a 1x1 Mixer, a Router, and 4 specialized Expert Bodies (Tactical, Strategical, Major endgame, Minor endgame). 
+*   **Incremental Updates**: A double-accumulator tracks incremental feature deltas, allowing inference in under 1 μs per position.
+*   **Native Execution**: The network is compiled directly to native C++ with SIMD-optimized inference, requiring no external ML runtimes.
+*   **Heuristic Fallback**: A classical evaluation (PeSTO Piece-Square Tables) is used when no neural network weights are loaded.
 
-## Targets and Compilation
+## Building the Engine
 
-The project uses CMake for build configuration. The native target dynamically links against `onnxruntime`, while the WebAssembly target statically links the dependencies for execution in web workers.
-
-### Requirements
-*   **CMake**: `3.14+`
-*   **Compiler**: `g++` or `clang` (C++20 required)
-
-The engine requires `onnxruntime` (v1.23.0) for its neural network evaluation. You can automatically download the correct pre-compiled binaries for your operating system (macOS/Linux) by running the included setup script:
-
-```bash
-cd eval_model_onnx
-./download_onnxruntime.sh
-cd ../engine
-```
+### Prerequisites
+*   A C++20 compiler (GCC ≥ 12, Clang ≥ 15, or Apple Clang ≥ 14)
+*   CMake ≥ 3.20
+*   *(Optional)* Python ≥ 3.10 with PyTorch for training
+*   *(Optional)* Polyglot-format opening book
+*   *(Optional)* Syzygy tablebases for endgame probing
 
 ### Native Build (Linux / macOS)
 
 ```bash
+cd engine
 mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-The compiled binary `chess_engine` will be available in the `build` directory.
+The compiled binary `io-chess` will be available in the `build` directory.
 
 ### WebAssembly Build (Emscripten)
 
 The WASM build uses Emscripten and relies on `SharedArrayBuffer` for threading support (Pthreads). 
 
 ```bash
-cd engine/
+cd engine
 mkdir build_wasm && cd build_wasm
 emcmake cmake -DCMAKE_BUILD_TYPE=Release ..
 emmake make -j$(nproc)
@@ -75,10 +83,10 @@ emmake make -j$(nproc)
 
 ## Usage
 
-**io-chess** communicates via the Universal Chess Interface (UCI) protocol and can be attached to standard GUIs (e.g. Cute Chess, Arena).
+**io-chess** communicates via the Universal Chess Interface (UCI) protocol and can be attached to standard GUIs (e.g., Cute Chess, Arena, Lichess-bot).
 
 ```bash
-./chess_engine
+./io-chess
 ```
 
 **Supported UCI Commands:**
@@ -87,3 +95,15 @@ emmake make -j$(nproc)
 *   `position [startpos | fen <fen>] moves <moves>`: Configure the board state.
 *   `go [depth <limit> | wtime <ms> btime <ms>]`: Begin search algorithm.
 *   `quit`: Terminate the process.
+
+## Documentation
+
+Full architectural documentation is available in the `docs/` directory. You can generate the comprehensive HTML documentation using Doxygen:
+
+```bash
+doxygen Doxyfile
+```
+
+## License
+
+This project is developed as part of a university research initiative. See the repository for licensing details.
