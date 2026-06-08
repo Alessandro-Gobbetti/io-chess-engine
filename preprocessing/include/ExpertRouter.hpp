@@ -1,4 +1,9 @@
+/**
+ * @file ExpertRouter.hpp
+ * @brief Computes expert weights for the Residual MoE architecture based on position features.
+ */
 #pragma once
+#include "FactorizedFeatureExtractor.hpp"
 #include "FeatureExtractor.hpp"
 #include <algorithm>
 #include <array>
@@ -172,6 +177,60 @@ public:
   }
 
   /**
+   * Compute expert weights directly from factorized features.
+   * This avoids extracting ChessInput when factorized preprocessing is selected.
+   */
+  static void compute_weights(const FactorizedInput &input, float eval_cp,
+                              ExpertWeights &out) {
+    float phase = compute_phase(input);
+    float cct = compute_cct(input);
+    float major_ratio = compute_major_ratio(input);
+
+    float raw_base[NUM_BASE] = {0.0f};
+
+    float endgame_factor = sigmoid((phase - PHASE_ENDGAME_THRESHOLD) * 8.0f);
+    float middlegame_factor = 1.0f - endgame_factor;
+
+    float tactical_strength =
+        sigmoid((cct - CCT_STRATEGIC_THRESHOLD) /
+                    (CCT_TACTICAL_THRESHOLD - CCT_STRATEGIC_THRESHOLD) *
+                    4.0f -
+                2.0f);
+
+    raw_base[TACTICAL] = middlegame_factor * tactical_strength * SCORE_MAX;
+    raw_base[STRATEGIC] =
+        middlegame_factor * (1.0f - tactical_strength) * SCORE_MAX;
+    raw_base[MAJOR_END] = endgame_factor * major_ratio * SCORE_MAX;
+    raw_base[MINOR_END] = endgame_factor * (1.0f - major_ratio) * SCORE_MAX;
+
+    for (int i = 0; i < NUM_BASE; ++i) {
+      raw_base[i] = std::max(raw_base[i], SCORE_MIN);
+    }
+
+    softmax(raw_base, out.weights, NUM_BASE);
+
+    for (int i = 0; i < NUM_BASE; ++i) {
+      out.raw_scores[i] = raw_base[i];
+    }
+
+    if (eval_cp < -SURVIVOR_CP_THRESHOLD) {
+      float deficit = std::abs(eval_cp) - SURVIVOR_CP_THRESHOLD;
+      out.weights[SURVIVOR] = std::clamp(deficit / AUX_RAMP_RANGE, 0.0f, 1.0f);
+    } else {
+      out.weights[SURVIVOR] = 0.0f;
+    }
+    out.raw_scores[SURVIVOR] = out.weights[SURVIVOR];
+
+    if (eval_cp > KILLER_CP_THRESHOLD) {
+      float bonus = eval_cp - KILLER_CP_THRESHOLD;
+      out.weights[KILLER] = std::clamp(bonus / AUX_RAMP_RANGE, 0.0f, 1.0f);
+    } else {
+      out.weights[KILLER] = 0.0f;
+    }
+    out.raw_scores[KILLER] = out.weights[KILLER];
+  }
+
+  /**
    * Get top-k expert indices and their weights.
    *
    * @param weights  The computed expert weights
@@ -219,6 +278,10 @@ private:
    */
   static float compute_phase(const ChessInput &input) {
     return input.global[FeatureExtractor::GlobalIndices::PHASE];
+  }
+
+  static float compute_phase(const FactorizedInput &input) {
+    return input.global[FactorizedFeatureExtractor::GlobalIndices::PHASE];
   }
 
   /**
@@ -277,6 +340,82 @@ private:
     return cct;
   }
 
+  static bool has_overlap_factorized(const FactorizedInput &input,
+                                     int attacker_group_begin,
+                                     int attacker_group_end,
+                                     int target_presence_group) {
+    using FE = FactorizedFeatureExtractor;
+    for (int g = attacker_group_begin; g <= attacker_group_end; ++g) {
+      for (int sq = 0; sq < 64; ++sq) {
+        if (input.branches[g][FE::ATTACKS][sq] > 0.5f &&
+            input.branches[target_presence_group][FE::PRESENCE][sq] > 0.5f) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  static float compute_cct(const FactorizedInput &input) {
+    using FE = FactorizedFeatureExtractor;
+
+    float cct = 0.0f;
+
+    const int us_begin = FE::US_PAWN;
+    const int us_end = FE::US_KING;
+    const int them_begin = FE::THEM_PAWN;
+    const int them_end = FE::THEM_KING;
+
+    bool us_in_check = has_overlap_factorized(input, them_begin, them_end,
+                                              FE::US_KING);
+    bool them_in_check = has_overlap_factorized(input, us_begin, us_end,
+                                                FE::THEM_KING);
+    cct += (us_in_check ? CCT_WEIGHT_CHECK : 0.0f);
+    cct += (them_in_check ? CCT_WEIGHT_CHECK : 0.0f);
+
+    if (has_overlap_factorized(input, us_begin, us_end, FE::THEM_PAWN))
+      cct += PIECE_VALUE_PAWN;
+    if (has_overlap_factorized(input, us_begin, us_end,
+                               FE::THEM_KNIGHT))
+      cct += PIECE_VALUE_KNIGHT;
+    if (has_overlap_factorized(input, us_begin, us_end,
+                               FE::THEM_BISHOP))
+      cct += PIECE_VALUE_BISHOP;
+    if (has_overlap_factorized(input, us_begin, us_end, FE::THEM_ROOK))
+      cct += PIECE_VALUE_ROOK;
+    if (has_overlap_factorized(input, us_begin, us_end,
+                               FE::THEM_QUEEN))
+      cct += PIECE_VALUE_QUEEN;
+
+    if (has_overlap_factorized(input, them_begin, them_end, FE::US_PAWN))
+      cct += PIECE_VALUE_PAWN;
+    if (has_overlap_factorized(input, them_begin, them_end,
+                               FE::US_KNIGHT))
+      cct += PIECE_VALUE_KNIGHT;
+    if (has_overlap_factorized(input, them_begin, them_end,
+                               FE::US_BISHOP))
+      cct += PIECE_VALUE_BISHOP;
+    if (has_overlap_factorized(input, them_begin, them_end, FE::US_ROOK))
+      cct += PIECE_VALUE_ROOK;
+    if (has_overlap_factorized(input, them_begin, them_end,
+                               FE::US_QUEEN))
+      cct += PIECE_VALUE_QUEEN;
+
+    bool us_major_threatened =
+        has_overlap_factorized(input, them_begin, them_end, FE::US_ROOK) ||
+        has_overlap_factorized(input, them_begin, them_end,
+                               FE::US_QUEEN);
+    bool them_major_threatened =
+        has_overlap_factorized(input, us_begin, us_end, FE::THEM_ROOK) ||
+        has_overlap_factorized(input, us_begin, us_end,
+                               FE::THEM_QUEEN);
+
+    cct += (us_major_threatened ? CCT_WEIGHT_MAJOR_THREAT : 0.0f);
+    cct += (them_major_threatened ? CCT_WEIGHT_MAJOR_THREAT : 0.0f);
+
+    return cct;
+  }
+
   /**
    * Check if position has major pieces (rooks or queens)
    */
@@ -321,6 +460,33 @@ private:
     float total = major_mat + minor_mat;
     if (total < 1e-6f) {
       return 0.5f; // Pawn endgame - neutral
+    }
+
+    return major_mat / total;
+  }
+
+  static float compute_major_ratio(const FactorizedInput &input) {
+    using G = FactorizedFeatureExtractor::GlobalIndices;
+
+    float major_mat = 0.0f;
+    major_mat +=
+        (input.global[G::US_MAT_ROOK] + input.global[G::THEM_MAT_ROOK]) * 2.0f *
+        PIECE_VALUE_ROOK;
+    major_mat +=
+        (input.global[G::US_MAT_QUEEN] + input.global[G::THEM_MAT_QUEEN]) *
+        1.0f * PIECE_VALUE_QUEEN;
+
+    float minor_mat = 0.0f;
+    minor_mat +=
+        (input.global[G::US_MAT_KNIGHT] + input.global[G::THEM_MAT_KNIGHT]) *
+        2.0f * PIECE_VALUE_KNIGHT;
+    minor_mat +=
+        (input.global[G::US_MAT_BISHOP] + input.global[G::THEM_MAT_BISHOP]) *
+        2.0f * PIECE_VALUE_BISHOP;
+
+    float total = major_mat + minor_mat;
+    if (total < 1e-6f) {
+      return 0.5f;
     }
 
     return major_mat / total;
