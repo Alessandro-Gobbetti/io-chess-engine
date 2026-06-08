@@ -1,3 +1,7 @@
+/**
+ * @file Writers.hpp
+ * @brief Utility classes for writing packed dataset features and labels to disk.
+ */
 #pragma once
 #include "ExpertRouter.hpp"     // For ExpertWeights struct
 #include "FeatureExtractor.hpp" // For ChessInput struct
@@ -10,13 +14,28 @@
 #include <string>
 #include <vector>
 
+struct alignas(64) PackedChessInput {
+  // Planes 0-29 are categorical (pieces, moves, threats). 
+  // Pack each 64-square plane into a SINGLE 64-bit integer.
+  // Size: 30 * 8 bytes = 240 bytes
+  uint64_t bitboards[30]; 
+
+  // Planes 30-31 are continuous (King distance), keep as uint8_t
+  // Size: 2 * 64 bytes = 128 bytes
+  uint8_t continuous_layers[2][64]; 
+
+  // Global features
+  // Size: 16 * 4 bytes = 64 bytes
+  float global[16]; 
+};
+
 class DatasetWriter {
 private:
   std::string filename;
   size_t batch_size;
 
-  // Buffer stores the actual structs
-  std::vector<ChessInput> buffer;
+  // Buffer stores the packed structs to save memory
+  std::vector<PackedChessInput> buffer;
 
 public:
   DatasetWriter(const std::string &fname, size_t batch_capacity = 1000);
@@ -39,10 +58,10 @@ public:
 };
 
 /**
- * WDLWriter - Writes WDL + Mate Distance labels during preprocessing
+ * WDLWriter - Writes WDL labels during preprocessing
  *
- * Output format: 4 x float32 per position [Win, Draw, Loss, MateDistance]
- * Total: 16 bytes per position
+ * Output format: 3 x float32 per position [Win, Draw, Loss]
+ * Total: 12 bytes per position
  */
 class WDLWriter {
 private:

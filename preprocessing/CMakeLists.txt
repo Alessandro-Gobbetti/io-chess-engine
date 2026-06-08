@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
 project(ChessFeatureExtractor LANGUAGES CXX)
 
+# Some Apple CLT setups ship libc++ headers only in the SDK path.
+# Add that directory explicitly so standard headers like <functional> resolve.
+if(APPLE)
+    execute_process(
+        COMMAND xcrun --show-sdk-path
+        OUTPUT_VARIABLE MACOS_SDK_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    set(MACOS_LIBCXX_INCLUDE "${MACOS_SDK_PATH}/usr/include/c++/v1")
+    if(EXISTS "${MACOS_LIBCXX_INCLUDE}")
+        include_directories(SYSTEM "${MACOS_LIBCXX_INCLUDE}")
+    endif()
+endif()
+
 # --- 1. C++ Standard (std=c++20) ---
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

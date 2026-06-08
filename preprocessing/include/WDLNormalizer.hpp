@@ -1,37 +1,28 @@
+/**
+ * @file WDLNormalizer.hpp
+ * @brief Conversion from raw evaluation strings to WDL (Win/Draw/Loss) probabilities.
+ */
 #pragma once
 #include <algorithm>
 #include <cmath>
 #include <string>
 
 /**
- * WDL (Win/Draw/Loss) + Mate Distance output structure.
+ * WDL (Win/Draw/Loss) output structure.
  * Used as training labels for the MoE model.
  */
 struct WDLOutput {
-  float win;       // Probability of winning (0.0 - 1.0)
-  float draw;      // Probability of draw (0.0 - 1.0)
-  float loss;      // Probability of losing (0.0 - 1.0)
-  float mate_dist; // Mate urgency: 0.0 = no mate, 1.0 = M1 (see below)
+  float win;  // Probability of winning (0.0 - 1.0)
+  float draw; // Probability of draw (0.0 - 1.0)
+  float loss; // Probability of losing (0.0 - 1.0)
 };
 
 /**
- * WDLNormalizer - Converts eval strings to WDL probabilities + mate distance.
+ * WDLNormalizer - Converts eval strings to WDL probabilities.
  *
  * Uses:
  *   - Sigmoid with SCALE=272 (Lichess constant) for centipawn → win probability
- *   - Exponential decay for mate distance: M1=0.607, M2=0.368, M10=0.007
  *   - Side-to-Move perspective (positive = we are winning)
- *
- * Mate Distance Scaling:
- *   Uses exponential decay: exp(-MATE_DECAY * N) where N = moves to mate.
- *   This gives more precision at low values:
- *     M1 = 0.607   (mate in 1 - very urgent)
- *     M2 = 0.368   (strong difference from M1)
- *     M3 = 0.223
- *     M5 = 0.082
- *     M10 = 0.007  (less urgent, already mostly solved)
- *   Compared to hyperbolic 1/(1+0.05*N):
- *     M1 = 0.952, M2 = 0.909 (too similar)
  */
 class WDLNormalizer {
 public:
@@ -39,15 +30,11 @@ public:
   // Tuned on millions of real games
   static constexpr float SCALE = 1.0f / 0.00368208;
 
-  // Mate decay: exponential provides better precision at low values
-  // exp(-0.5*N): M1=0.607, M2=0.368, M5=0.082, M10=0.007
-  static constexpr float MATE_DECAY = 0.5f;
-
   // Large CP value for mate scores (for router)
   static constexpr float MATE_CP = 15000.0f;
 
   /**
-   * Parse eval string into WDL + mate distance (Side-to-Move perspective).
+   * Parse eval string into WDL (Side-to-Move perspective).
    *
    * CSV evals are from White's perspective. This function flips the result
    * when Black is to move, so the output is always from the current player's
@@ -70,7 +57,7 @@ public:
         cp = std::stof(eval_str);
       } catch (...) {
         // Fallback to equal position
-        return {0.33f, 0.34f, 0.33f, 0.0f};
+        return {0.33f, 0.34f, 0.33f};
       }
       result = handle_centipawns(cp);
     }
@@ -78,7 +65,6 @@ public:
     // Flip perspective for Black: swap Win <-> Loss
     if (!is_white_to_move) {
       std::swap(result.win, result.loss);
-      // mate_dist stays the same (it's about urgency, not who wins)
     }
 
     return result;
@@ -149,36 +135,23 @@ private:
     l = std::max(0.0f, l);
     float sum = w + d + l;
 
-    return {w / sum, d / sum, l / sum, 0.0f}; // No mate in CP positions
+    return {w / sum, d / sum, l / sum};
   }
 
   /**
    * Convert mate score to WDL.
    * "#5" = we mate in 5, "#-3" = they mate us in 3.
-   *
-   * Uses shifted exponential decay: exp(-MATE_DECAY * (N-1))
-   * This maximizes the useful range since M0 doesn't exist:
-   *   M1 = 1.000 (mate in 1 - maximum urgency)
-   *   M2 = 0.607
-   *   M3 = 0.368
-   *   M5 = 0.135
-   *   M10 = 0.011
    */
   static WDLOutput handle_mate(std::string s) {
     s.erase(std::remove(s.begin(), s.end(), '#'), s.end());
     int moves = std::stoi(s);
 
-    // Shifted exponential decay: N-1 so that M1 = 1.0
-    // exp(-0.5 * 0) = 1.0, exp(-0.5 * 1) = 0.607, exp(-0.5 * 9) = 0.011
-    float n = static_cast<float>(std::abs(moves));
-    float dist = std::exp(-MATE_DECAY * (n - 1.0f));
-
     if (moves > 0) {
-      // We mate them: Win=1.0, with mate urgency
-      return {1.0f, 0.0f, 0.0f, dist};
+      // We mate them: Win=1.0
+      return {1.0f, 0.0f, 0.0f};
     } else {
-      // They mate us: Loss=1.0, mate distance = how threatened we are
-      return {0.0f, 0.0f, 1.0f, dist};
+      // They mate us: Loss=1.0
+      return {0.0f, 0.0f, 1.0f};
     }
   }
 };

@@ -1,3 +1,7 @@
+/**
+ * @file FeatureExtractor.hpp
+ * @brief Standard sparse/dense feature extraction logic for chess positions.
+ */
 #pragma once
 #include "chess.hpp"
 #include <array>

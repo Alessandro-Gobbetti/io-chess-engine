@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++20 -O3 -march=native -Iinclude -Ilib/chess -Ilib/progressbar -pthread
+CXXFLAGS = -std=c++20 -O3 -march=native -Iinclude -Ilib/chess -Ilib/progressbar -pthread -isystem $(shell xcrun --show-sdk-path)/usr/include/c++/v1
 SRC_DIR = src
 OBJ_DIR = build
 BIN_DIR = bin

@@ -1,4 +1,9 @@
+/**
+ * @file Writers.cpp
+ * @brief Implementation of dataset writing utilities.
+ */
 #include "Writers.hpp"
+#include <cstring>
 
 // --- DatasetWriter Implementation ---
 
@@ -15,7 +20,28 @@ DatasetWriter::DatasetWriter(const std::string &fname, size_t batch_capacity)
 DatasetWriter::~DatasetWriter() { flush(); }
 
 void DatasetWriter::add(const ChessInput &features) {
-  buffer.push_back(features);
+  PackedChessInput packed{};
+  
+  // Pack 30 categorical layers into bitboards
+  for (int i = 0; i < 30; ++i) {
+    uint64_t bb = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+      if (features.layers[i][sq] > 0) {
+        bb |= (1ULL << sq);
+      }
+    }
+    packed.bitboards[i] = bb;
+  }
+  
+  // Copy 2 continuous layers (indices 30 and 31)
+  for (int i = 0; i < 2; ++i) {
+    std::memcpy(packed.continuous_layers[i], features.layers[30 + i], 64);
+  }
+  
+  // Copy global features
+  std::memcpy(packed.global, features.global, sizeof(packed.global));
+
+  buffer.push_back(packed);
 
   if (buffer.size() >= batch_size) {
     flush();
@@ -31,7 +57,7 @@ void DatasetWriter::flush() {
     // Write the raw memory of the vector directly
     // size in bytes = number of elements * size of one struct
     file.write(reinterpret_cast<const char *>(buffer.data()),
-               buffer.size() * sizeof(ChessInput));
+               buffer.size() * sizeof(PackedChessInput));
     buffer.clear();
   }
 }
@@ -67,7 +93,7 @@ void LabelWriter::flush() {
 // --- WDLWriter Implementation ---
 
 WDLWriter::WDLWriter(const std::string &fname, size_t batch_capacity)
-    : filename(fname), batch_size(batch_capacity * 4) { // 4 floats per sample
+    : filename(fname), batch_size(batch_capacity * 3) { // 3 floats per sample
   // Create/truncate file
   std::ofstream file(filename, std::ios::binary);
   buffer.reserve(batch_size);
@@ -79,7 +105,6 @@ void WDLWriter::add(const WDLOutput &wdl) {
   buffer.push_back(wdl.win);
   buffer.push_back(wdl.draw);
   buffer.push_back(wdl.loss);
-  buffer.push_back(wdl.mate_dist);
 
   if (buffer.size() >= batch_size) {
     flush();

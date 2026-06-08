@@ -1,3 +1,7 @@
+/**
+ * @file EvalNormalizer.hpp
+ * @brief Utilities for normalizing chess evaluations into win probabilities.
+ */
 #pragma once
 #include <string>
 #include <cmath>

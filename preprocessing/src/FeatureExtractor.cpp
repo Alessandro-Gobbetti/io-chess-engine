@@ -1,3 +1,7 @@
+/**
+ * @file FeatureExtractor.cpp
+ * @brief Implementation of standard feature extraction.
+ */
 #include "FeatureExtractor.hpp"
 #include <algorithm>
 #include <cstring>
