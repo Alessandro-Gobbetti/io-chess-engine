@@ -1,3 +1,8 @@
+/**
+ * @file Tablebase.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "Tablebase.h"
 extern "C" {
 #include "../../external/fathom/src/tbprobe.h"

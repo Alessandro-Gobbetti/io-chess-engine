@@ -1,6 +1,12 @@
 #pragma once
-// Tablebase.h - Syzygy tablebase probing via Fathom
-// Provides WDL (Win-Draw-Loss) and DTZ (Distance to Zero) lookups
+
+/**
+ * @file Tablebase.h
+ * @brief Syzygy tablebase probing via Fathom.
+ *
+ * Provides WDL (Win-Draw-Loss) and DTZ (Distance to Zero) lookups 
+ * for endgame positions using the Fathom library.
+ */
 
 #include "../Types.h"
 #include <string>
@@ -8,41 +14,67 @@
 
 namespace Tablebase {
 
-// Tablebase probe result
+/**
+ * @enum WDL
+ * @brief Tablebase probe result for Win-Draw-Loss.
+ */
 enum class WDL {
-    WIN = 2,
-    CURSED_WIN = 1,  // Win but 50-move rule draw
-    DRAW = 0,
-    BLESSED_LOSS = -1,  // Loss but 50-move rule draw
-    LOSS = -2
+    WIN = 2,            ///< Forced win.
+    CURSED_WIN = 1,     ///< Win, but thwarted by the 50-move rule (draw).
+    DRAW = 0,           ///< Forced draw.
+    BLESSED_LOSS = -1,  ///< Loss, but saved by the 50-move rule (draw).
+    LOSS = -2           ///< Forced loss.
 };
 
-// Initialize tablebases with given path
-// Returns true on success
+/**
+ * @brief Initializes tablebases with the given path.
+ * 
+ * @param path Path to the Syzygy tablebase files.
+ * @return True on success, false otherwise.
+ */
 bool init(const std::string& path);
 
-// Check if position is in tablebase range (inline for performance)
-// Returns true if <=5 pieces (or configured max)
+/**
+ * @brief Checks if a position is within the tablebase piece limits.
+ * 
+ * @param board The chess board to check.
+ * @return True if the board has <= maxPieces() pieces.
+ */
 bool available(const Board& board);
 
-// Probe Win-Draw-Loss (WDL) table
-// Returns WDL value from side-to-move perspective
-// Returns nullopt if not available or probe fails
+/**
+ * @brief Probes the Win-Draw-Loss (WDL) table.
+ * 
+ * @param board The chess board to probe.
+ * @return WDL value from side-to-move's perspective, or std::nullopt on failure.
+ */
 std::optional<WDL> probeWDL(const Board& board);
 
-// Probe Distance-to-Zero (DTZ) table for root moves
-// Returns best move, WDL value, and DTZ value
-// Returns nullopt if not available or probe fails
+/**
+ * @brief Probes the Distance-to-Zero (DTZ) table for root moves.
+ * 
+ * @param board The chess board to probe.
+ * @return Tuple of best move, WDL value, and DTZ value, or std::nullopt on failure.
+ */
 std::optional<std::tuple<Move, WDL, int>> probeRoot(const Board& board);
 
-// Convert WDL to centipawn score for search
-// mate_ply is distance to mate (used for WIN/LOSS)
+/**
+ * @brief Converts a WDL result to a centipawn score for search evaluation.
+ * 
+ * @param wdl The WDL result.
+ * @param mate_ply Distance to mate (used to scale WIN/LOSS scores).
+ * @return Centipawn score representation of the tablebase result.
+ */
 int wdlToScore(WDL wdl, int mate_ply);
 
-// Get maximum pieces supported
+/**
+ * @brief Gets the maximum number of pieces supported by the loaded tablebases.
+ */
 int maxPieces();
 
-// Check if tablebases are initialized
+/**
+ * @brief Checks if tablebases have been successfully initialized.
+ */
 bool isInitialized();
 
 } // namespace Tablebase

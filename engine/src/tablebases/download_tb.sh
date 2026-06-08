@@ -1,4 +1,7 @@
 #!/bin/bash
+## @file download_tb.sh
+## @brief Missing description.
+## @ingroup engine
 
 # ==============================================================================
 #  SYZYGY COMPLETE DOWNLOADER (WDL + DTZ)
@@ -35,31 +38,43 @@ fi
 # ------------------------------------------------------------------------------
 # We list the base names (e.g., "KPvK"). The script appends .rtbw and .rtbz
 
+# FILES=(
+#     # --- 3 PIECES ---
+#     "KPvK" "KQvK" "KRvK" "KBvK" "KNvK"
+
+#     # --- 4 PIECES: NO PAWNS ---
+#     "KBvKB" "KBvKN" "KBBvK" "KBNvK" 
+#     "KNvKN" "KNNvK" 
+#     "KQvKB" "KQvKN" "KQvKQ" "KQvKR"
+#     "KRvKB" "KRvKN" "KRvKR"
+#     "KRRvK" "KQBvK" "KQNvK" "KQRvK"
+#     "KRBvK" "KRNvK"
+
+#     # --- 4 PIECES: WITH PAWNS ---
+#     "KPPvK" 
+#     "KBPvK" "KBvKP"
+#     "KNPvK" "KNvKP"
+#     "KQPvK" "KQvKP"
+#     "KRPvK" "KRvKP"
+
+#     # promotion endings
+#     "KQQvK"
+# )
+
 FILES=(
-    # --- 3 PIECES ---
-    "KPvK" "KQvK" "KRvK" "KBvK" "KNvK"
+    # --- 3 PIECES: 5 ---
+    "KBvK" "KNvK" "KPvK" "KQvK" "KRvK"
 
-    # --- 4 PIECES: NO PAWNS ---
-    "KBvKB" "KBvKN" "KBBvK" "KBNvK" 
-    "KNvKN" "KNNvK" 
-    "KQvKB" "KQvKN" "KQvKQ" "KQvKR"
-    "KRvKB" "KRvKN" "KRvKR"
-    "KRRvK" "KQBvK" "KQNvK" "KQRvK"
-    "KRBvK" "KRNvK"
+    # --- 4 PIECES: 30 ---
+    "KBBvK" "KBNvK" "KBPvK" "KBvKB" "KBvKN" "KBvKP" "KNNvK" "KNPvK" "KNvKN" "KNvKP" "KPPvK" "KPvKP" "KQBvK" "KQNvK" "KQPvK" "KQQvK" "KQRvK" "KQvKB" "KQvKN" "KQvKP" "KQvKQ" "KQvKR" "KRBvK" "KRNvK" "KRPvK" "KRRvK" "KRvKB" "KRvKN" "KRvKP" "KRvKR"
 
-    # --- 4 PIECES: WITH PAWNS ---
-    "KPPvK" 
-    "KBPvK" "KBvKP"
-    "KNPvK" "KNvKP"
-    "KQPvK" "KQvKP"
-    "KRPvK" "KRvKP"
-
-    # promotion endings
-    "KQQvK"
+    # --- 5 PIECES: 110 ---
+    "KBBBvK" "KBBNvK" "KBBPvK" "KBBvKB" "KBBvKN" "KBBvKP" "KBBvKQ" "KBBvKR" "KBNNvK" "KBNPvK" "KBNvKB" "KBNvKN" "KBNvKP" "KBNvKQ" "KBNvKR" "KBPPvK" "KBPvKB" "KBPvKN" "KBPvKP" "KBPvKQ" "KBPvKR" "KNNNvK" "KNNPvK" "KNNvKB" "KNNvKN" "KNNvKP" "KNNvKQ" "KNNvKR" "KNPPvK" "KNPvKB" "KNPvKN" "KNPvKP" "KNPvKQ" "KNPvKR" "KPPPvK" "KPPvKB" "KPPvKN" "KPPvKP" "KPPvKQ" "KPPvKR" "KQBBvK" "KQBNvK" "KQBPvK" "KQBvKB" "KQBvKN" "KQBvKP" "KQBvKQ" "KQBvKR" "KQNNvK" "KQNPvK" "KQNvKB" "KQNvKN" "KQNvKP" "KQNvKQ" "KQNvKR" "KQPPvK" "KQPvKB" "KQPvKN" "KQPvKP" "KQPvKQ" "KQPvKR" "KQQBvK" "KQQNvK" "KQQPvK" "KQQQvK" "KQQRvK" "KQQvKB" "KQQvKN" "KQQvKP" "KQQvKQ" "KQQvKR" "KQRBvK" "KQRNvK" "KQRPvK" "KQRRvK" "KQRvKB" "KQRvKN" "KQRvKP" "KQRvKQ" "KQRvKR" "KRBBvK" "KRBNvK" "KRBPvK" "KRBvKB" "KRBvKN" "KRBvKP" "KRBvKQ" "KRBvKR" "KRNNvK" "KRNPvK" "KRNvKB" "KRNvKN" "KRNvKP" "KRNvKQ" "KRNvKR" "KRPPvK" "KRPvKB" "KRPvKN" "KRPvKP" "KRPvKQ" "KRPvKR" "KRRBvK" "KRRNvK" "KRRPvK" "KRRRvK" "KRRvKB" "KRRvKN" "KRRvKP" "KRRvKQ" "KRRvKR"
 )
 
-# Optional: Essential/small 5-piece files (may be worth having)
-FILES+=("KRPvKR" "KPPvKP" "KBPvKB" "KNNvKB" "KQQvKR" "KQRvKB" "KQQvKB" "KQQvKN" "KNNvKN" "KRRvKN" "KRRvKB" "KQQvKP" "KQRvKR" "KQQvKQ")
+
+# # Optional: Essential/small 5-piece files (may be worth having)
+# FILES+=("KRPvKR" "KPPvKP" "KBPvKB" "KNNvKB" "KQQvKR" "KQRvKB" "KQQvKB" "KQQvKN" "KNNvKN" "KRRvKN" "KRRvKB" "KQQvKP" "KQRvKR" "KQQvKQ")
 
 # 3. DOWNLOAD LOOP
 # ------------------------------------------------------------------------------

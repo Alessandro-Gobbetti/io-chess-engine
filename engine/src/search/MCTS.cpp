@@ -1,3 +1,8 @@
+/**
+ * @file MCTS.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "MCTS.h"
 #include <algorithm>
 #include <chrono>
@@ -19,7 +24,7 @@ Move MCTS::startSearch(Board &root, const SearchParams &params) {
 
   if (moves.size() == 0) {
     searching_ = false;
-    return Move(); // No legal moves
+    return Move(Move::NO_MOVE); // No legal moves
   }
 
   if (moves.size() == 1) {

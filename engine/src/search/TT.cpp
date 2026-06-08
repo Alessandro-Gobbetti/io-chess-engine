@@ -1,6 +1,13 @@
+/**
+ * @file TT.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "TT.h"
 #include "../Types.h"
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -8,6 +15,29 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
+
+namespace {
+constexpr std::array<char, 8> kTTFileMagic = {'I', 'O', 'T', 'T', 'F', 'U',
+                                               'L', 'L'};
+constexpr uint32_t kTTFileVersion = 1;
+
+struct TTFileHeader {
+  char magic[8];
+  uint32_t version;
+  uint64_t clusterCount;
+  uint8_t currentAge;
+  uint8_t reserved[7];
+};
+
+struct TTDiskCluster {
+  uint64_t entryData[3];
+  uint64_t entrySignature[3];
+  uint64_t evalPayload;
+  uint64_t evalSignature;
+};
+static_assert(sizeof(TTDiskCluster) == 64,
+              "TTDiskCluster must stay 64 bytes");
+} // namespace
 
 TranspositionTable::~TranspositionTable() {
   if (table_) {
@@ -99,15 +129,14 @@ void TranspositionTable::prefetch(uint64_t key) const {
   __builtin_prefetch(&table_[index(key)]);
 }
 
-bool TranspositionTable::probe(uint64_t key, int depth, int alpha, int beta,
-                               int &score, Move &bestMove, int &entryDepth,
+bool TranspositionTable::probe(uint64_t key, int depth, int &score,
+                               Move &bestMove, int &entryDepth,
                                Bound &entryBound) const {
   if (disableTT_ || !table_)
     return false;
 
   const Cluster &cluster = table_[index(key)];
   int maxMoveDepth = -1;
-  bool cutoffFound = false;
 
   // Check all 3 slots in the cluster
   for (int i = 0; i < 3; ++i) {
@@ -123,15 +152,18 @@ bool TranspositionTable::probe(uint64_t key, int depth, int alpha, int beta,
       Bound bound = static_cast<Bound>(static_cast<uint8_t>(boundRaw) & 0x3);
       int16_t eScore = TTEntry::getScore(d);
 
-      // Export entry data regardless of depth/age checks
-      // This is crucial for heuristics like Singular Extensions
-      // which analyze TT entries that don't meet cutoff requirements
-      score = eScore;
-      entryDepth = static_cast<int>(eDepth);
-      entryBound = boundRaw;
+      // Export entry data ONLY from recent entries (≤2 generations).
+      // Stale entries may belong to different positions sharing the same
+      // hash index. Using their score/bound for heuristics like Singular
+      // Extensions can cause blunders (e.g. incorrect sBeta cutoff).
+      if (ageDiff(eAge) <= 2) {
+        score = eScore;
+        entryDepth = static_cast<int>(eDepth);
+        entryBound = bound;
+      }
 
-      // Improved Move Ordering Logic
-      if (move != 0) {
+      // Move ordering: also age-guarded
+      if (move != 0 && ageDiff(eAge) <= 2) {
         int priority = static_cast<int>(eDepth) - ageDiff(eAge);
         if (priority > maxMoveDepth) {
           maxMoveDepth = priority;
@@ -147,12 +179,7 @@ bool TranspositionTable::probe(uint64_t key, int depth, int alpha, int beta,
       if (eAge != currentAge_)
         continue;
 
-      if (bound == Bound::EXACT)
-        return true;
-      if (bound == Bound::UPPER && score <= alpha)
-        return true;
-      if (bound == Bound::LOWER && score >= beta)
-        return true;
+      return true;
     }
   }
 
@@ -161,20 +188,21 @@ bool TranspositionTable::probe(uint64_t key, int depth, int alpha, int beta,
 
 Move TranspositionTable::probeMove(uint64_t key) const {
   if (disableTT_ || !table_)
-    return Move();
+    return Move(Move::NO_MOVE);
 
   const Cluster &cluster = table_[index(key)];
-  Move bestFound = Move();
+  Move bestFound = Move(Move::NO_MOVE);
   int maxDepth = -1;
 
   for (int i = 0; i < 3; ++i) {
     uint64_t d;
     if (cluster.entries[i].probe(key, d)) {
-      // Relaxed age check: accept moves from any generation
+      // Accept moves only from recent entries (≤2 generations)
+      // to avoid pollution from stale positions sharing the same hash index.
       uint16_t move = TTEntry::getMove(d);
-      if (move != 0) {
+      uint8_t eAge = TTEntry::getAge(d);
+      if (move != 0 && ageDiff(eAge) <= 2) {
         int eDepth = static_cast<int>(TTEntry::getDepth(d));
-        uint8_t eAge = TTEntry::getAge(d);
         int priority = eDepth - ageDiff(eAge);
 
         if (priority > maxDepth) {
@@ -264,7 +292,18 @@ void TranspositionTable::store(uint64_t key, int depth, int score, Bound bound,
   for (int i = 0; i < 3; ++i) {
     uint64_t d;
     if (cluster.entries[i].probe(key, d)) {
-      // Found exact key match - always update this slot
+      // Found exact key match.
+      // Protect deep current-generation entries from being overwritten by
+      // shallow non-EXACT stores (e.g., qsearch transpositions).
+      uint8_t oldDepth = TTEntry::getDepth(d);
+      uint8_t oldAge = TTEntry::getAge(d);
+      Bound newBound =
+          static_cast<Bound>(static_cast<uint8_t>(bound) & 0x3);
+      if (depth < static_cast<int>(oldDepth) && ageDiff(oldAge) == 0 &&
+          newBound != Bound::EXACT) {
+        return;
+      }
+
       replaceTarget = &cluster.entries[i];
 
       // Preserve move if new entry has no move
@@ -365,4 +404,96 @@ void TranspositionTable::dumpToFile(const std::string &filename) const {
       }
     }
   }
+}
+
+bool TranspositionTable::saveFullToFile(const std::string &filename) const {
+  if (!table_)
+    return false;
+
+  std::ofstream out(filename, std::ios::binary);
+  if (!out)
+    return false;
+
+  TTFileHeader header{};
+  std::memcpy(header.magic, kTTFileMagic.data(), kTTFileMagic.size());
+  header.version = kTTFileVersion;
+  header.clusterCount = static_cast<uint64_t>(clusterCount_);
+  header.currentAge = currentAge_;
+
+  out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+  if (!out)
+    return false;
+
+  for (size_t i = 0; i < clusterCount_; ++i) {
+    const Cluster &cluster = table_[i];
+    TTDiskCluster dc{};
+
+    for (int j = 0; j < 3; ++j) {
+      dc.entryData[j] =
+          __atomic_load_n(&cluster.entries[j].data, __ATOMIC_RELAXED);
+      dc.entrySignature[j] =
+          __atomic_load_n(&cluster.entries[j].signature, __ATOMIC_RELAXED);
+    }
+
+    dc.evalPayload = cluster.eval.payload.load(std::memory_order_relaxed);
+    dc.evalSignature = cluster.eval.signature.load(std::memory_order_relaxed);
+
+    out.write(reinterpret_cast<const char *>(&dc), sizeof(dc));
+    if (!out)
+      return false;
+  }
+
+  return true;
+}
+
+bool TranspositionTable::loadFullFromFile(const std::string &filename) {
+  if (!table_)
+    return false;
+
+  std::ifstream in(filename, std::ios::binary);
+  if (!in)
+    return false;
+
+  TTFileHeader header{};
+  in.read(reinterpret_cast<char *>(&header), sizeof(header));
+  if (!in)
+    return false;
+
+  if (std::memcmp(header.magic, kTTFileMagic.data(), kTTFileMagic.size()) !=
+      0) {
+    std::cerr << "info string TT load failed: invalid file magic" << std::endl;
+    return false;
+  }
+  if (header.version != kTTFileVersion) {
+    std::cerr << "info string TT load failed: unsupported version "
+              << header.version << std::endl;
+    return false;
+  }
+  if (header.clusterCount != static_cast<uint64_t>(clusterCount_)) {
+    std::cerr << "info string TT load failed: hash size mismatch (file clusters="
+              << header.clusterCount << ", engine clusters=" << clusterCount_
+              << ")" << std::endl;
+    return false;
+  }
+
+  for (size_t i = 0; i < clusterCount_; ++i) {
+    TTDiskCluster dc{};
+    in.read(reinterpret_cast<char *>(&dc), sizeof(dc));
+    if (!in)
+      return false;
+
+    Cluster &cluster = table_[i];
+    for (int j = 0; j < 3; ++j) {
+      __atomic_store_n(&cluster.entries[j].signature, dc.entrySignature[j],
+                       __ATOMIC_RELAXED);
+      __atomic_store_n(&cluster.entries[j].data, dc.entryData[j],
+                       __ATOMIC_RELAXED);
+    }
+
+    cluster.eval.signature.store(dc.evalSignature, std::memory_order_relaxed);
+    cluster.eval.payload.store(dc.evalPayload, std::memory_order_relaxed);
+  }
+
+  currentAge_ = header.currentAge & 0x1F;
+  return true;
 }
