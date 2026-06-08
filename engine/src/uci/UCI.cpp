@@ -1,54 +1,65 @@
+/**
+ * @file UCI.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "UCI.h"
 #include "../eval/Evaluator.h"
 #include "../eval/SimpleEvalContext.h"
 
 #include "../tablebases/Tablebase.h"
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
 #include <iomanip>
-#ifdef __EMSCRIPTEN__
-#include <cstdio>
-#include <emscripten.h>
-#include <emscripten/threading.h>
+#include <cctype>
+#include "../platform/WasmSupport.h"
 
-// Futex-based stdin notification: instead of polling with sleep_for(5ms),
-// the UCI loop waits on this flag. JS calls notify_stdin() after writing
-// data to the SharedArrayBuffer, waking the futex immediately.
-static int32_t g_stdinReady __attribute__((aligned(4))) = 0;
+namespace {
 
-extern "C" EMSCRIPTEN_KEEPALIVE void notify_stdin() {
-  __atomic_store_n(&g_stdinReady, 1, __ATOMIC_SEQ_CST);
-  emscripten_futex_wake(&g_stdinReady, 1);
+int64_t steadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
-#endif
+
+int64_t elapsedSinceNs(int64_t startNs) {
+  if (startNs <= 0)
+    return 0;
+  const int64_t nowNs = steadyNowNs();
+  if (nowNs <= startNs)
+    return 0;
+  return (nowNs - startNs) / 1000000;
+}
+
+} // namespace
 
 UciProtocol::UciProtocol(const std::string &modelPath, bool useSimpleEval,
                          const std::string &tbPath, const std::string &bookPath,
                          const std::string &bookPath2, int evalThreads)
-    : modelPath_(modelPath), useSimpleEval_(useSimpleEval), tbPath_(tbPath),
-      bookPath_(bookPath), bookPath2_(bookPath2), evalThreads_(evalThreads) {
+    : options_{modelPath, tbPath, bookPath, bookPath2, 128, 1, evalThreads, false, useSimpleEval} {
   // Initialize TT with default size
-  tt_.resize(hashSizeMB_);
+  tt_.resize(options_.hashSizeMB);
 
   // Initialize tablebases if path provided
-  if (!tbPath_.empty()) {
-    Tablebase::init(tbPath_);
+  if (!options_.tbPath.empty()) {
+    Tablebase::init(options_.tbPath);
   }
 
   // Initialize opening book if path provided
-  if (!bookPath_.empty()) {
-    book_ = std::make_unique<PolyglotBook>(bookPath_);
+  if (!options_.bookPath.empty()) {
+    book_ = std::make_unique<PolyglotBook>(options_.bookPath);
     if (book_) {
       book_->load();
     }
   }
 
   // Initialize secondary opening book if path provided
-  if (!bookPath2_.empty()) {
-    book2_ = std::make_unique<PolyglotBook>(bookPath2_);
+  if (!options_.bookPath2.empty()) {
+    book2_ = std::make_unique<PolyglotBook>(options_.bookPath2);
     if (book2_) {
       book2_->load();
     }
@@ -68,23 +79,20 @@ void UciProtocol::loop() {
 
   while (true) {
     if (!std::getline(std::cin, line)) {
-#ifdef __EMSCRIPTEN__
-      // WASM non-blocking stdin: Module.stdin returns null when no data
-      // is available, causing std::getline to fail with EOF. Clear both
-      // the C++ stream and musl FILE* EOF flag, then wait for JS to
-      // signal new data via notify_stdin() instead of polling.
-      std::cin.clear();
-      clearerr(stdin);
-      // Wait on futex until JS signals data is available.
-      // Timeout after 5s as a safety net (e.g. if notify missed).
-      while (__atomic_load_n(&g_stdinReady, __ATOMIC_SEQ_CST) == 0) {
-        emscripten_futex_wait(&g_stdinReady, 0, 5000.0);
+      if (platform::waitForStdin()) {
+        continue;
       }
-      __atomic_store_n(&g_stdinReady, 0, __ATOMIC_SEQ_CST);
-      continue;
-#else
+      // Native stdin closed (common for one-shot pipes). If a bounded search
+      // is running, let it finish and emit bestmove before exiting. For
+      // potentially unbounded searches (go infinite / ponder), force stop.
+      if (searchThread_.joinable()) {
+        if (searchMayRunForever_.load(std::memory_order_relaxed)) {
+          if (searcher_)
+            searcher_->stop();
+        }
+        searchThread_.join();
+      }
       break; // Native: EOF on stdin means quit
-#endif
     }
     std::istringstream is(line);
     std::string command;
@@ -108,6 +116,28 @@ void UciProtocol::loop() {
       handleStop();
     } else if (command == "eval") {
       handleEval();
+    } else if (command == "ttsave") {
+      std::string filename;
+      is >> filename;
+      if (filename.empty()) {
+        std::cout << "info string usage: ttsave <path>" << std::endl;
+      } else if (tt_.saveFullToFile(filename)) {
+        std::cout << "info string TT saved to " << filename << std::endl;
+      } else {
+        std::cout << "info string failed to save TT to " << filename
+                  << std::endl;
+      }
+    } else if (command == "ttload") {
+      std::string filename;
+      is >> filename;
+      if (filename.empty()) {
+        std::cout << "info string usage: ttload <path>" << std::endl;
+      } else if (tt_.loadFullFromFile(filename)) {
+        std::cout << "info string TT loaded from " << filename << std::endl;
+      } else {
+        std::cout << "info string failed to load TT from " << filename
+                  << std::endl;
+      }
     } else if (command == "quit") {
       handleQuit();
       break;
@@ -137,8 +167,7 @@ void UciProtocol::loop() {
           int ttScore;
           int ttDepth;
           Bound ttBound;
-          if (tt_.probe(key, 0, -32000, 32000, ttScore, ttMove, ttDepth,
-                        ttBound)) {
+          if (tt_.probe(key, 0, ttScore, ttMove, ttDepth, ttBound)) {
             std::cout << "TT Hit! Score: " << ttScore
                       << " Move: " << chess::uci::moveToUci(ttMove)
                       << " Depth: " << ttDepth << std::endl;
@@ -150,13 +179,6 @@ void UciProtocol::loop() {
               std::cout << "TT Miss" << std::endl;
             }
           }
-        } else if (subcommand == "debug") {
-          std::string mode;
-          is >> mode;
-          bool enable = (mode == "on");
-          tt_.setDebugMode(enable);
-          std::cout << "TT Debug Mode: " << (enable ? "ON" : "OFF")
-                    << std::endl;
         }
       }
     }
@@ -164,121 +186,17 @@ void UciProtocol::loop() {
 }
 
 void UciProtocol::handleUci() {
-  std::cout << "id name " << ENGINE_NAME << std::endl;
-  std::cout << "id author " << ENGINE_AUTHOR << std::endl;
-
-  // Options
-  std::cout << "option name Hash type spin default 128 min 1 max 4096"
-            << std::endl;
-  std::cout << "option name Threads type spin default 1 min 1 max 128"
-            << std::endl;
-  std::cout << "option name EvalThreads type spin default 0 min 0 max 128"
-            << std::endl;
-  std::cout << "option name ModelPath type string default " << modelPath_
-            << std::endl;
-  std::cout << "option name SearchType type combo default Negamax var Negamax "
-               "var MCTS"
-            << std::endl;
-  std::cout
-      << "option name EvalType type combo default Neural var Neural var Simple"
-      << std::endl;
-  std::cout << "option name EvalDevice type combo default Auto var Auto var "
-               "CPU var GPU"
-            << std::endl;
-  std::cout << "option name OwnBook type check default true" << std::endl;
-  std::cout << "option name BookPath type string default " << bookPath_
-            << std::endl;
-  std::cout << "option name BookPath2 type string default " << bookPath2_
-            << std::endl;
-  std::cout << "option name SyzygyPath type string default " << tbPath_
-            << std::endl;
-  std::cout << "option name Aggression type spin default 0 min -100 max 100"
-            << std::endl;
-  std::cout << "option name EvalNormalizationBase type spin default 750 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name EvalNormalizationWeight type spin default 25 min 1 max 200"
-            << std::endl;
-  std::cout << "option name EnableEvalNormalization type check default true"
-            << std::endl;
-  std::cout << "option name DisableTT type check default false" << std::endl;
-  std::cout << "option name LazyEvalMaxDepth type spin default 6 min 0 max 10"
-            << std::endl;
-  std::cout
-      << "option name LazyEvalBaseMargin type spin default 500 min 0 max 2000"
-      << std::endl;
-  std::cout
-      << "option name LazyEvalDepthMargin type spin default 100 min 0 max 500"
-      << std::endl;
-  std::cout << "option name EnableLazyEval type check default "
-            << enableLazyEval_ << std::endl;
-  std::cout << "option name UCI_Chess960 type check default false"
-            << std::endl;
-
-  // Search Configuration
-  std::cout << "option name RazorMarginD1 type spin default 350 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name RazorMarginD2 type spin default 700 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name RazorMarginD3 type spin default 900 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name FutilityMargin type spin default 200 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name ReverseFutilityMargin type spin default 120 min 0 "
-               "max 2000"
-            << std::endl;
-  std::cout << "option name LMPBase type spin default 2 min 0 max 10"
-            << std::endl;
-  std::cout << "option name LMRThreshold type spin default 4 min 0 max 10"
-            << std::endl;
-  std::cout << "option name NullMoveR type spin default 3 min 0 max 10"
-            << std::endl;
-  std::cout << "option name DeltaMargin type spin default 200 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name SingularMargin type spin default 50 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name SingularMinDepth type spin default 6 min 0 max 20"
-            << std::endl;
-  std::cout << "option name InternalPruningMargin type spin default 150 min 0 "
-               "max 2000"
-            << std::endl;
-  std::cout << "option name CorrWeight type spin default 4 min 0 max 25"
-            << std::endl;
-  std::cout << "option name EnableCorrHist type check default true"
-            << std::endl;
-
-  // Tunable Parameters
-  std::cout << "option name RazorMarginD1 type spin default 350 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name RazorMarginD2 type spin default 700 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name RazorMarginD3 type spin default 900 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name FutilityMargin type spin default 200 min 0 max 2000"
-            << std::endl;
-  std::cout << "option name ReverseFutilityMargin type spin default 120 min 0 "
-               "max 2000"
-            << std::endl;
-  std::cout << "option name LMPBase type spin default 2 min 0 max 10"
-            << std::endl;
-  std::cout << "option name LMRThreshold type spin default 4 min 0 max 10"
-            << std::endl;
-  std::cout << "option name NullMoveR type spin default 3 min 0 max 10"
-            << std::endl;
-  std::cout << "option name DeltaMargin type spin default 200 min 0 max 2000"
-            << std::endl;
-
-  // Stats Export Options
-  std::cout << "option name ExportTree type check default false" << std::endl;
-  std::cout << "option name ExportTreeDepth type spin default 4 min 1 max 10" << std::endl;
-
+  std::cout << "id name " << ENGINE_NAME << "\n";
+  std::cout << "id author " << ENGINE_AUTHOR << "\n";
+  options_.printOptions();
   std::cout << "uciok" << std::endl;
 }
 
 void UciProtocol::handleIsReady() {
   // Initialize engine if not already done.
-  // For SimpleEval mode, evaluators_ is always empty (no ONNX Evaluator);
+  // For SimpleEval mode, evaluators_ is always empty;
   // check evalCtxs_ instead to avoid re-initializing every time.
-  bool needsInit = useSimpleEval_ ? evalCtxs_.empty() : evaluators_.empty();
+  bool needsInit = options_.useSimpleEval ? evalCtxs_.empty() : evaluators_.empty();
   if (needsInit) {
     initializeEngine();
   }
@@ -293,190 +211,28 @@ void UciProtocol::handleSetOption(std::istringstream &is) {
   while (is >> token && token != "value") {
     optionName += (optionName.empty() ? "" : " ") + token;
   }
-  std::cout << "info string Setting option " << optionName << std::endl;
 
   std::string value;
   while (is >> token) {
     value += (value.empty() ? "" : " ") + token;
   }
-  std::cout << "info string New value: " << value << std::endl;
 
-  // Process options
-  if (optionName == "Hash") {
-    hashSizeMB_ = std::stoul(value);
-    tt_.resize(hashSizeMB_);
-  } else if (optionName == "Threads") {
-    std::cout << "info string Setting number of threads to " << value
-              << std::endl;
-    int newThreads = std::max(1, std::stoi(value));
-    std::cout << "info string Actual number of threads set to " << newThreads
-              << std::endl;
-    if (newThreads != numThreads_) {
-      numThreads_ = newThreads;
-      tt_.setNumThreads(
-          numThreads_); // Enable TT to skip ABDADA when single-threaded
-      // Force re-initialization with new thread count
-      evaluators_.clear();
-      evalCtxs_.clear();
-    }
-  } else if (optionName == "EvalThreads") {
-    int newEvalThreads = std::stoi(value);
-    if (newEvalThreads != evalThreads_) {
-      evalThreads_ = newEvalThreads;
-      std::cout << "info string Setting evaluation threads to " << evalThreads_
-                << (evalThreads_ == 0 ? " (Auto)" : "") << std::endl;
-      // Reinitialize engine
-      evaluators_.clear();
-      evalCtxs_.clear();
-    }
-  } else if (optionName == "ModelPath") {
-    modelPath_ = value;
-    // Reinitialize engine with new model
-    evaluators_.clear();
-    evalCtxs_.clear();
-  } else if (optionName == "SearchType") {
-    useMCTS_ = (value == "MCTS");
-  } else if (optionName == "EvalType") {
-    useSimpleEval_ = (value == "Simple");
-    // Reinitialize
-    evaluators_.clear();
-    evalCtxs_.clear();
-  } else if (optionName == "EvalDevice") {
-    if (value == "Auto" || value == "CPU" || value == "ONNX-CPU")
-      useGPU_ = false;
-    else if (value == "GPU" || value == "ONNX-GPU")
-      useGPU_ = true;
-    else
-      std::cout << "info string Unknown EvalDevice: " << value << std::endl;
-
-    // Reinitialize
-    evaluators_.clear();
-    evalCtxs_.clear();
-  } else if (optionName == "OwnBook") {
-    useBook_ = (value == "true");
-  } else if (optionName == "BookPath") {
-    bookPath_ = value;
-    if (!bookPath_.empty()) {
-      book_ = std::make_unique<PolyglotBook>(bookPath_);
-      if (book_) {
-        book_->load();
-      }
-    } else {
-      book_.reset();
-    }
-  } else if (optionName == "BookPath2") {
-    bookPath2_ = value;
-    if (!bookPath2_.empty()) {
-      book2_ = std::make_unique<PolyglotBook>(bookPath2_);
-      if (book2_) {
-        book2_->load();
-      }
-    } else {
-      book2_.reset();
-    }
-  } else if (optionName == "Aggression") {
-    // UCI spin value is -100 to 100, convert to -1.0 to 1.0
-    aggression_ = std::clamp(std::stof(value) / 100.0f, -1.0f, 1.0f);
-    // Update all existing eval contexts
-    for (auto &ctx : evalCtxs_) {
-      ctx->setAggression(aggression_);
-    }
-    std::cout << "info string Aggression set to " << aggression_ << std::endl;
-  } else if (optionName == "EvalNormalizationBase") {
-    evalScaleBase_ = std::stoi(value);
-    for (auto &ctx : evalCtxs_) {
-      ctx->setEvalScale(evalScaleBase_, evalScaleWeight_);
-    }
-    std::cout << "info string EvalNormalizationBase set to " << evalScaleBase_ << std::endl;
-  } else if (optionName == "EvalNormalizationWeight") {
-    evalScaleWeight_ = std::stoi(value);
-    for (auto &ctx : evalCtxs_) {
-      ctx->setEvalScale(evalScaleBase_, evalScaleWeight_);
-    }
-    std::cout << "info string EvalNormalizationWeight set to " << evalScaleWeight_ << std::endl;
-  } else if (optionName == "EnableEvalNormalization") {
-    enableEvalNormalization_ = (value == "true");
-    for (auto &ctx : evalCtxs_) {
-      ctx->setEvalNormalization(enableEvalNormalization_);
-    }
-    std::cout << "info string EnableEvalNormalization set to " << (enableEvalNormalization_ ? "true" : "false") << std::endl;
-  } else if (optionName == "SyzygyPath") {
-    // Set tablebase path
-    tbPath_ = value;
-    if (!tbPath_.empty()) {
-      Tablebase::init(tbPath_);
-    }
-  } else if (optionName == "DisableTT") {
-    bool disable = (value == "true");
-    tt_.setDisabled(disable);
-    tt_.setDisabled(disable);
-    std::cout << "info string TT " << (disable ? "disabled" : "enabled")
-              << std::endl;
-  } else if (optionName == "LazyEvalMaxDepth") {
-    lazyEvalMaxDepth_ = std::stoi(value);
-  } else if (optionName == "LazyEvalBaseMargin") {
-    lazyEvalBaseMargin_ = std::stoi(value);
-  } else if (optionName == "LazyEvalDepthMargin") {
-    lazyEvalDepthMargin_ = std::stoi(value);
-  } else if (optionName == "EnableLazyEval") {
-    enableLazyEval_ = (value == "true");
-  } else if (optionName == "RazorMarginD1") {
-    searchConfig_.razorMarginD1 = std::stoi(value);
-  } else if (optionName == "RazorMarginD2") {
-    searchConfig_.razorMarginD2 = std::stoi(value);
-  } else if (optionName == "RazorMarginD3") {
-    searchConfig_.razorMarginD3 = std::stoi(value);
-  } else if (optionName == "FutilityMargin") {
-    searchConfig_.futilityMargin = std::stoi(value);
-  } else if (optionName == "ReverseFutilityMargin") {
-    searchConfig_.reverseFutilityMargin = std::stoi(value);
-  } else if (optionName == "LMPBase") {
-    searchConfig_.lmpBase = std::stoi(value);
-  } else if (optionName == "LMRThreshold") {
-    searchConfig_.lmrThreshold = std::stoi(value);
-  } else if (optionName == "NullMoveR") {
-    searchConfig_.nullMoveR = std::stoi(value);
-  } else if (optionName == "DeltaMargin") {
-    searchConfig_.deltaMargin = std::stoi(value);
-  } else if (optionName == "SingularMargin") {
-    searchConfig_.singularMargin = std::stoi(value);
-  } else if (optionName == "SingularMinDepth") {
-    searchConfig_.singularMinDepth = std::stoi(value);
-  } else if (optionName == "InternalPruningMargin") {
-    searchConfig_.internalPruningMargin = std::stoi(value);
-  } else if (optionName == "CorrWeight") {
-    searchConfig_.corrWeight = std::stoi(value);
-    std::cout << "info string CorrWeight set to " << searchConfig_.corrWeight << std::endl;
-  } else if (optionName == "EnableCorrHist") {
-    searchConfig_.enableCorrHist = (value == "true");
-    std::cout << "info string CorrHist " << (searchConfig_.enableCorrHist ? "enabled" : "disabled") << std::endl;
-  } else if (optionName == "UCI_Chess960") {
-    chess960_ = (value == "true");
-    std::cout << "info string Chess960 mode " << (chess960_ ? "enabled" : "disabled")
-              << std::endl;
-  } else if (optionName == "UCI_AnalyseMode") {
-    analyseMode_ = (value == "true");
-  } else if (optionName == "ExportTree") {
-    exportTree_ = (value == "true");
-  } else if (optionName == "ExportTreeDepth") {
-    exportTreeDepth_ = std::stoi(value);
-  } else {
-    std::cout << "info string Unknown option: " << optionName << std::endl;
-  }
+  options_.setOption(optionName, value, this);
 }
 
 void UciProtocol::handleUciNewGame() {
   tt_.clear();
   consecutiveBookMisses_ = 0;
-  chess960_ = false;  // Reset to standard chess by default
+  options_.chess960 = false;  // Reset to standard chess by default
 }
 
 void UciProtocol::handlePosition(std::istringstream &is) {
   std::string token;
   is >> token;
+  std::string lastAppliedMove;
 
   if (token == "startpos") {
-    currentBoard_ = Board(chess::constants::STARTPOS, chess960_);
+    currentBoard_ = Board(chess::constants::STARTPOS, options_.chess960);
     consecutiveBookMisses_ = 0; // Reset misses for each new sequence
     is >> token; // Consume "moves" if present
   } else if (token == "fen") {
@@ -484,7 +240,7 @@ void UciProtocol::handlePosition(std::istringstream &is) {
     while (is >> token && token != "moves") {
       fen += (fen.empty() ? "" : " ") + token;
     }
-    currentBoard_ = Board(fen, chess960_);
+    currentBoard_ = Board(fen, options_.chess960);
   }
 
   // Apply moves
@@ -492,14 +248,19 @@ void UciProtocol::handlePosition(std::istringstream &is) {
     Move move = chess::uci::uciToMove(currentBoard_, token);
     if (move.move() != Move::NO_MOVE) {
       currentBoard_.makeMove(move);
-      // DEBUG: Log applied move
-      // std::cout << "info string DEBUG: Applied move " << token
-      //           << " New FEN: " << currentBoard_.getFen() << std::endl;
+      lastAppliedMove = token;
     } else {
       std::cerr << "Invalid move in position command: " << token << std::endl;
-      std::cout << "info string DEBUG: Failed to parse move " << token
+      std::cout << "info string failed to parse move " << token
                 << " FEN: " << currentBoard_.getFen() << std::endl;
     }
+  }
+
+  // Save one TT snapshot per position update, keyed to the most recent move.
+  // GUIs resend full move history on each position command, so saving inside the
+  // loop would duplicate snapshots for old moves many times.
+  if (!lastAppliedMove.empty()) {
+    saveTTSnapshotForMove(lastAppliedMove);
   }
 }
 
@@ -512,9 +273,21 @@ void UciProtocol::handleGo(std::istringstream &is) {
   }
 
   // Initialize engine if needed (same SimpleEval-aware check as handleIsReady)
-  bool needsInit = useSimpleEval_ ? evalCtxs_.empty() : evaluators_.empty();
+  bool needsInit = options_.useSimpleEval ? evalCtxs_.empty() : evaluators_.empty();
   if (needsInit) {
     initializeEngine();
+  }
+
+  if (!pendingTTLoadFile_.empty()) {
+    const std::string fileToLoad = pendingTTLoadFile_;
+    pendingTTLoadFile_.clear();
+    if (tt_.loadFullFromFile(fileToLoad)) {
+      std::cout << "info string TT preloaded for search from " << fileToLoad
+                << std::endl;
+    } else {
+      std::cout << "info string TT preload failed from " << fileToLoad
+                << std::endl;
+    }
   }
 
   // Parse search parameters early (needed for ponder handling)
@@ -552,7 +325,8 @@ void UciProtocol::handleGo(std::istringstream &is) {
         if (ponderMoveStr.length() >= 4 && ponderMoveStr.length() <= 5 &&
             ponderMoveStr[0] >= 'a' && ponderMoveStr[0] <= 'h') {
           Move pMove = chess::uci::uciToMove(currentBoard_, ponderMoveStr);
-          if (pMove != Move() && pMove.move() != Move::NO_MOVE) {
+          if (pMove.move() != Move::NO_MOVE &&
+              pMove.move() != Move::NULL_MOVE) {
             currentBoard_.makeMove(pMove);
           }
         } else {
@@ -576,18 +350,22 @@ void UciProtocol::handleGo(std::istringstream &is) {
   // Reset pondering state
   pondering_ = params.ponder;
   ponderResultReady_ = false;
-  ponderMove_ = Move(); // Clear previous ponder move
+  ponderMove_ = Move(Move::NO_MOVE); // Clear previous ponder move
   
   // Store params for potential ponderhit use
   if (params.ponder) {
     ponderParams_ = params;
   }
 
+  // Track whether this search might run forever without explicit stop.
+  searchMayRunForever_.store(params.infinite || params.ponder,
+                             std::memory_order_relaxed);
+
   // Check for book move (skip during pondering - want full analysis from
   // opponent's perspective)
-  if (useBook_ && !params.ponder) {
+  if (options_.useBook && !params.ponder) {
     // Stop searching books if we have missed too many times consecutively
-    if (analyseMode_ || consecutiveBookMisses_ < MAX_BOOK_MISSES) {
+    if (options_.analyseMode || consecutiveBookMisses_ < MAX_BOOK_MISSES) {
       chess::Move bookMove = chess::Move::NULL_MOVE;
       std::string bookSource;
 
@@ -609,9 +387,9 @@ void UciProtocol::handleGo(std::istringstream &is) {
 
       if (bookMove != chess::Move::NULL_MOVE) {
         consecutiveBookMisses_ = 0; // Reset on hit
-        if (!analyseMode_) {
+        if (!options_.analyseMode) {
           // Normal play: return the book move immediately
-          sendBestMove(bookMove);
+          sendBestMove(bookMove, Move(Move::NO_MOVE));
           std::cout << "info string Book move found in " << bookSource << ": "
                     << chess::uci::moveToSan(currentBoard_, bookMove)
                     << std::endl;
@@ -621,7 +399,7 @@ void UciProtocol::handleGo(std::istringstream &is) {
         // Fall through to the normal search for proper evaluation.
       } else {
         // Both books missed
-        if (!analyseMode_) {
+        if (!options_.analyseMode) {
           consecutiveBookMisses_++;
           if (consecutiveBookMisses_ >= MAX_BOOK_MISSES) {
             std::cout << "info string Book moves exhausted. Stopping book "
@@ -635,19 +413,33 @@ void UciProtocol::handleGo(std::istringstream &is) {
 
   // Check if engine is ready
   bool hasEvaluators = !evaluators_.empty();
-  if (useSimpleEval_) {
+  if (options_.useSimpleEval) {
      hasEvaluators = !evalCtxs_.empty();
   }
   
-  if (!hasEvaluators || evalCtxs_.size() < static_cast<size_t>(numThreads_)) {
+  if (!hasEvaluators || evalCtxs_.size() < static_cast<size_t>(options_.numThreads)) {
     std::cerr << "Engine not ready - model not loaded or thread count mismatch"
               << std::endl;
     std::cout << "bestmove 0000" << std::endl;
     return;
   }
 
+  // Snapshot baselines so all reported metrics are per-search deltas.
+  searchBaseFullRebuilds_ = 0;
+  for (const auto &ctx : evalCtxs_) {
+    if (ctx) {
+      searchBaseFullRebuilds_ += ctx->getFullRebuilds();
+    }
+  }
+  searchBaseTbHits_ = 0;
+  searchBaseTtHits_ = 0;
+
   // Prepare Workers
-  if (useMCTS_) {
+  if (options_.useMCTS) {
+    // MCTS doesn't use SearchSharedData counters; avoid leaking stale values
+    // from previous Negamax searches.
+    searchData_.reset();
+
     // MCTS remains single-threaded for now as its parallelization logic differs
     // Use first context
     auto mcts = std::make_unique<MCTS>(*evalCtxs_[0]);
@@ -660,14 +452,14 @@ void UciProtocol::handleGo(std::istringstream &is) {
       if (pv.size() >= 2) {
         ponderMove_ = pv[1];
       } else {
-        ponderMove_ = Move();
+        ponderMove_ = Move(Move::NO_MOVE);
       }
     });
     searcher_ = std::move(mcts);
 
     // Start MCTS search
     searchRunning_ = true;
-    // CRITICAL FIX: Capture searchBoard to avoid race with position commands
+    // Capture searchBoard to avoid race condition with position commands
     searchThread_ = std::thread([this, params, searchBoard]() {
       Board board = searchBoard;
       Move bestMove = searcher_->startSearch(board, params);
@@ -679,6 +471,7 @@ void UciProtocol::handleGo(std::istringstream &is) {
       } else {
         sendBestMove(bestMove, ponderMove_);
       }
+      searchMayRunForever_.store(false, std::memory_order_relaxed);
       searchRunning_ = false;
     });
 
@@ -689,22 +482,25 @@ void UciProtocol::handleGo(std::istringstream &is) {
     auto searchShared = std::make_shared<SearchSharedData>();
     searchData_ = searchShared; // Store for handlePonderHit() access
     // Set tuning params
-    searchShared->lazyEvalMaxDepth = lazyEvalMaxDepth_;
-    searchShared->lazyEvalBaseMargin = lazyEvalBaseMargin_;
-    searchShared->lazyEvalDepthMargin = lazyEvalDepthMargin_;
-    searchShared->enableLazyEval = enableLazyEval_;
-    searchShared->config = searchConfig_;
+    searchShared->lazyEvalMaxDepth = options_.lazyEvalMaxDepth;
+    searchShared->lazyEvalBaseMargin = options_.lazyEvalBaseMargin;
+    searchShared->lazyEvalDepthMargin = options_.lazyEvalDepthMargin;
+    searchShared->enableLazyEval = options_.enableLazyEval;
+    searchShared->config = options_.searchConfig;
+
+    searchBaseTbHits_ = searchShared->tbHits.load(std::memory_order_relaxed);
+    searchBaseTtHits_ = searchShared->ttHits.load(std::memory_order_relaxed);
     
     // LAZY SMP: Store thread count for helper coordination
-    searchShared->numThreads = numThreads_;
+    searchShared->numThreads = options_.numThreads;
 
     // Tree Export Shared Config
-    searchShared->exportTree = exportTree_;
-    searchShared->exportTreeDepth = exportTreeDepth_;
+    searchShared->exportTree = options_.exportTree;
+    searchShared->exportTreeDepth = options_.exportTreeDepth;
     searchShared->vizTree.clear(); // Clear previous tree
-    if (exportTree_) {
+    if (options_.exportTree) {
         // approximate allocation for depth 4 branching factor ~30
-        searchShared->vizTree.reserve(exportTreeDepth_ * 50000); 
+        searchShared->vizTree.reserve(options_.exportTreeDepth * 50000); 
     }
 
     // 2. Create Workers using PERSISTENT contexts
@@ -723,7 +519,7 @@ void UciProtocol::handleGo(std::istringstream &is) {
           if (pv.size() >= 2) {
             ponderMove_ = pv[1];
           } else {
-            ponderMove_ = Move();
+            ponderMove_ = Move(Move::NO_MOVE);
           }
         });
 
@@ -735,7 +531,7 @@ void UciProtocol::handleGo(std::istringstream &is) {
     std::vector<std::unique_ptr<Negamax>> helpers;
 
     // Create helpers for threads 1..numThreads-1
-    for (int i = 1; i < numThreads_; ++i) {
+    for (int i = 1; i < options_.numThreads; ++i) {
       if (i >= evalCtxs_.size())
         break; // Safety check
 
@@ -749,29 +545,18 @@ void UciProtocol::handleGo(std::istringstream &is) {
 
     // NOTE: We do NOT move contexts. They stay in UciProtocol.
     // They are thread-safe or thread-local by design (one per thread).
-    // CRITICAL FIX: Pass searchBoard (captured above at line 625) into the lambda.
+    // Pass searchBoard into the lambda.
     // Reading currentBoard_ inside the lambda is WRONG because another "position"
     // command may have modified it between handleGo() return and lambda execution.
     searchThread_ = std::thread([this, params, helpers = std::move(helpers),
                                  searchShared, mainWorkerPtr, searchBoard]() mutable {
       Board board = searchBoard;
 
-      // DEBUG: Log the FEN being searched to help diagnose position mismatches
-      if (params.ponder) {
-        std::cout << "info string DEBUG ponder search FEN: " << board.getFen() << std::endl;
-      }
-
-      // CRITICAL FIX: Ensure stop flag is reset BEFORE Helpers start
-      searchShared->stop = false;
-
       // Launch Helper Threads
       std::vector<std::thread> threadPool;
-      std::cout << "info string Launching " << helpers.size()
-                << " helper threads" << std::endl;
       for (size_t i = 0; i < helpers.size(); ++i) {
         auto *w = helpers[i].get();
         threadPool.emplace_back([w, board, params, i]() mutable {
-          // std::cout << "info string Helper " << i << " started" << std::endl;
           w->startSearch(board, params);
         });
       }
@@ -779,11 +564,8 @@ void UciProtocol::handleGo(std::istringstream &is) {
       // Run Main Search
       Move bestMove = mainWorkerPtr->startSearch(board, params);
 
-      // Wait for Helpers
-      for (auto &t : threadPool) {
-        if (t.joinable())
-          t.join();
-      }
+      // Ensure helpers terminate once main result is known.
+      searchShared->stop.store(true, std::memory_order_relaxed);
 
       // Output Result
       if (params.ponder) {
@@ -840,6 +622,14 @@ void UciProtocol::handleGo(std::istringstream &is) {
         }
         sendBestMove(bestMove, ponderMove_);
       }
+
+      // Join helpers after emitting bestmove so UCI stop responses are immediate.
+      for (auto &t : threadPool) {
+        if (t.joinable())
+          t.join();
+      }
+
+      searchMayRunForever_.store(false, std::memory_order_relaxed);
       searchRunning_ = false;
     });
   }
@@ -912,7 +702,7 @@ void UciProtocol::handlePonderHit() {
   searchData_->softLimit = allocation.softLimit;
   searchData_->hardLimit = allocation.hardLimit;
   // Reset start time to now since we're starting the "real" search
-  searchData_->startTime = std::chrono::steady_clock::now();
+  searchData_->startTimeNs.store(steadyNowNs(), std::memory_order_relaxed);
   
   std::cout << "info string ponderhit: reduced time (soft="
             << allocation.softLimit << "ms hard=" << allocation.hardLimit 
@@ -939,6 +729,8 @@ void UciProtocol::handleStop() {
   if (searchThread_.joinable()) {
     searchThread_.join();
   }
+
+  searchMayRunForever_.store(false, std::memory_order_relaxed);
   pondering_ = false;
   ponderResultReady_ = false;
 }
@@ -947,46 +739,44 @@ void UciProtocol::handleQuit() { handleStop(); }
 
 void UciProtocol::initializeEngine() {
   evaluators_.clear();
-  evaluators_.clear();
   evalCtxs_.clear();
 
   try {
-    std::cout << "info string Initializing engine with " << numThreads_
+    std::cout << "info string Initializing engine with " << options_.numThreads
               << " threads..." << std::endl;
 
-    if (useSimpleEval_) {
+    if (options_.useSimpleEval) {
       // Simple eval: one Evaluator with individual contexts
       std::cout << "info string Initializing Simple Evaluation (Hand-Crafted)..." << std::endl;
-      for (int i = 0; i < numThreads_; ++i) {
+      for (int i = 0; i < options_.numThreads; ++i) {
         evalCtxs_.push_back(std::make_unique<SimpleEvalContext>());
       }
-      // Note: evaluators_ list remains empty for SimpleEval as we don't use the ONNX Evaluator wrapper
+      // Note: evaluators_ list remains empty for SimpleEval.
     } else {
       // Neural eval: per-thread EvalContexts (no batching - simpler & faster)
-      if (modelPath_.empty()) {
+      if (options_.modelPath.empty()) {
         std::cerr << "Error: Model path required for Neural evaluation"
                   << std::endl;
         return;
       }
 
-      // === SMART EVAL THREAD ALLOCATION ===
-      // With shared ONNX sessions, we no longer multiply threads.
-      // The session is shared across all search threads.
+      // Keep EvalThreads behavior for compatibility with existing UCI configs.
+      // Native cache backend does not spawn separate evaluator worker pools.
       
       int evalThreadsPerInstance;
-      if (evalThreads_ == 0) {
+      if (options_.evalThreads == 0) {
         // Auto mode: smart allocation based on search threads
         int availableCores = std::thread::hardware_concurrency();
         if (availableCores <= 0) availableCores = 4;
         
         // Reserve cores for search threads, use remainder for eval
-        int remainingCores = std::max(1, availableCores - numThreads_);
+        int remainingCores = std::max(1, availableCores - options_.numThreads);
         
-        if (numThreads_ == 1) {
+        if (options_.numThreads == 1) {
           evalThreadsPerInstance = std::min(4, remainingCores);
-        } else if (numThreads_ <= 2) {
+        } else if (options_.numThreads <= 2) {
           evalThreadsPerInstance = std::min(3, remainingCores);
-        } else if (numThreads_ <= 4) {
+        } else if (options_.numThreads <= 4) {
           evalThreadsPerInstance = std::min(2, remainingCores);
         } else {
           evalThreadsPerInstance = 1;
@@ -994,38 +784,40 @@ void UciProtocol::initializeEngine() {
         
         evalThreadsPerInstance = std::max(1, evalThreadsPerInstance);
       } else {
-        evalThreadsPerInstance = evalThreads_;
+        evalThreadsPerInstance = options_.evalThreads;
       }
       
-      std::string deviceStr = useGPU_ ? "GPU" : "CPU";
-      std::cout << "info string Using ONNX Runtime (" << deviceStr << ") backend with SHARED session" << std::endl;
-      std::cout << "info string Lazy SMP (ONNX): " << numThreads_ 
-                << " search threads + " << evalThreadsPerInstance 
-                << " eval threads = " << (numThreads_ + evalThreadsPerInstance)
-                << " total CPU threads" << std::endl;
-      
-      // Create ONE shared evaluator
-      auto sharedEvaluator = std::make_unique<Evaluator>(modelPath_, evalThreadsPerInstance, useGPU_);
+      auto sharedEvaluator = std::make_unique<Evaluator>(options_.modelPath, evalThreadsPerInstance);
+
+      std::cout << "info string Using native incremental MoE cache backend" << std::endl;
+      std::cout << "info string Lazy SMP (native cache): " << options_.numThreads
+                << " search threads total" << std::endl;
       
       // Create lightweight contexts from shared evaluator
-      for (int i = 0; i < numThreads_; ++i) {
+      for (int i = 0; i < options_.numThreads; ++i) {
         auto ctx = sharedEvaluator->createThreadContext();
         evalCtxs_.push_back(std::move(ctx));
       }
       
-      // Keep evaluator alive (owns the shared session)
+      // Keep evaluator alive (owns shared model weights)
       evaluators_.push_back(std::move(sharedEvaluator));
       
-      std::cout << "info string Created " << numThreads_ 
-                << " eval contexts sharing single ONNX session" << std::endl;
+      std::cout << "info string Created " << options_.numThreads
+                << " native incremental eval contexts" << std::endl;
     }
 
     std::cout << "info string Engine initialized with " << evalCtxs_.size()
               << " evaluation contexts" << std::endl;
 
+    for (auto &ctx : evalCtxs_) {
+      ctx->setAggression(options_.aggression);
+      ctx->setEvalScale(options_.evalScaleBase, options_.evalScaleWeight);
+      ctx->setEvalNormalization(options_.enableEvalNormalization);
+      ctx->setIncrementalRebuildInterval(options_.nativeRebuildEveryNEvals);
+    }
+
   } catch (const std::exception &e) {
     std::cerr << "Failed to initialize engine: " << e.what() << std::endl;
-    evaluators_.clear();
     evaluators_.clear();
     evalCtxs_.clear();
   }
@@ -1059,31 +851,124 @@ std::string UciProtocol::formatScore(int score) {
 
 void UciProtocol::sendInfo(int depth, int score, int nodes, int nps,
                            const std::vector<Move> &pv, const Board &board) {
-  std::cout << "info depth " << depth << " score " << formatScore(score)
-            << " nodes " << nodes << " nps " << nps;
+  (void)board;
+
+  int seldepth = 0;
+  uint64_t tbHits = 0;
+  uint64_t ttHits = 0;
+  int64_t elapsedMs = 0;
+
+  if (searchData_) {
+    seldepth = searchData_->selDepth.load(std::memory_order_relaxed);
+    const uint64_t tbHitsTotal =
+      searchData_->tbHits.load(std::memory_order_relaxed);
+    const uint64_t ttHitsTotal =
+      searchData_->ttHits.load(std::memory_order_relaxed);
+    tbHits = tbHitsTotal >= searchBaseTbHits_ ? tbHitsTotal - searchBaseTbHits_
+                          : 0;
+    ttHits = ttHitsTotal >= searchBaseTtHits_ ? ttHitsTotal - searchBaseTtHits_
+                          : 0;
+    const int64_t startNs =
+      searchData_->startTimeNs.load(std::memory_order_relaxed);
+    elapsedMs = elapsedSinceNs(startNs);
+  }
+
+  uint64_t fullRebuildsTotal = 0;
+  for (const auto &ctx : evalCtxs_) {
+    if (ctx) {
+      fullRebuildsTotal += ctx->getFullRebuilds();
+    }
+  }
+  const uint64_t fullRebuilds =
+      fullRebuildsTotal >= searchBaseFullRebuilds_
+          ? fullRebuildsTotal - searchBaseFullRebuilds_
+          : 0;
+
+  std::cout << "info depth " << depth << " seldepth " << seldepth
+            << " score " << formatScore(score) << " nodes " << nodes
+            << " nps " << nps << " tbhits " << tbHits << " time "
+            << elapsedMs;
 
   if (!pv.empty()) {
     std::cout << " pv";
     // Output PV in UCI notation
     for (const Move &move : pv) {
-      std::cout << " " << chess::uci::moveToUci(move, chess960_);
+      std::cout << " " << chess::uci::moveToUci(move, options_.chess960);
     }
   }
+
+  std::cout << " string tt_hits " << ttHits << " full_rebuilds "
+            << fullRebuilds;
 
   std::cout << std::endl;
 }
 
 void UciProtocol::sendBestMove(Move move, Move ponderMove) {
-  std::cout << "bestmove " << chess::uci::moveToUci(move, chess960_);
-  if (ponderMove != Move() && ponderMove.move() != Move::NO_MOVE) {
-    std::cout << " ponder " << chess::uci::moveToUci(ponderMove, chess960_);
+  std::cout << "bestmove " << chess::uci::moveToUci(move, options_.chess960);
+
+  if (ponderMove.move() != Move::NO_MOVE &&
+      ponderMove.move() != Move::NULL_MOVE) {
+    try {
+      std::cout << " ponder " << chess::uci::moveToUci(ponderMove, options_.chess960);
+    } catch (const std::exception &) {
+      // Ignore malformed ponder move; bestmove itself is authoritative.
+    }
   }
   std::cout << std::endl;
 }
 
+void UciProtocol::saveTTSnapshotForMove(const std::string &moveUci) {
+  if (!options_.autoSaveTTSnapshots)
+    return;
+
+  std::error_code ec;
+  std::filesystem::create_directories(options_.ttSnapshotDir, ec);
+  if (ec) {
+    std::cout << "info string TT snapshot mkdir failed for " << options_.ttSnapshotDir
+              << ": " << ec.message() << std::endl;
+    return;
+  }
+
+  const uint64_t snapshotId = ++ttSnapshotCounter_;
+  const uint64_t hash = currentBoard_.hash();
+  std::ostringstream hexHash;
+  hexHash << std::hex << std::setw(16) << std::setfill('0') << hash;
+
+  const std::string side = currentBoard_.sideToMove() == Color::WHITE ? "w" : "b";
+  std::ostringstream filename;
+  filename << "tt_" << std::setw(6) << std::setfill('0') << snapshotId
+           << "_fm" << currentBoard_.fullMoveNumber() << "_" << side
+           << "_" << sanitizeForFilename(moveUci) << "_" << hexHash.str()
+           << ".bin";
+
+  const std::filesystem::path outPath =
+      std::filesystem::path(options_.ttSnapshotDir) / filename.str();
+  if (tt_.saveFullToFile(outPath.string())) {
+    std::cout << "info string TT snapshot saved: " << outPath.string()
+              << std::endl;
+  } else {
+    std::cout << "info string TT snapshot save failed: " << outPath.string()
+              << std::endl;
+  }
+}
+
+std::string UciProtocol::sanitizeForFilename(const std::string &value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char c : value) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isalnum(uc) || c == '_' || c == '-') {
+      out.push_back(c);
+    } else {
+      out.push_back('_');
+    }
+  }
+  return out.empty() ? "move" : out;
+}
+
 void UciProtocol::handleEval() {
   // Initialize if needed
-  bool needsInit = useSimpleEval_ ? evalCtxs_.empty() : evaluators_.empty();
+  bool needsInit = options_.useSimpleEval ? evalCtxs_.empty() : evaluators_.empty();
   if (needsInit) {
     initializeEngine();
   }
@@ -1097,6 +982,56 @@ void UciProtocol::handleEval() {
   auto wdl = evalCtxs_[0]->evaluateWDL(currentBoard_);
   
   std::cout << "wdl " << std::fixed << std::setprecision(4) 
-            << wdl.win << " " << wdl.draw << " " << wdl.loss 
-            << " mate " << wdl.mate << std::endl;
+            << wdl.win << " " << wdl.draw << " " << wdl.loss << std::endl;
+}
+
+void UciProtocol::resizeHash(size_t mb) {
+  tt_.resize(mb);
+}
+
+void UciProtocol::updateThreads(int numThreads) {
+  tt_.setNumThreads(numThreads);
+  evaluators_.clear();
+  evalCtxs_.clear();
+}
+
+void UciProtocol::reinitEngine() {
+  evaluators_.clear();
+  evalCtxs_.clear();
+  initializeEngine();
+}
+
+void UciProtocol::updateEvalContexts() {
+  for (auto &ctx : evalCtxs_) {
+    ctx->setAggression(options_.aggression);
+    ctx->setEvalScale(options_.evalScaleBase, options_.evalScaleWeight);
+    ctx->setEvalNormalization(options_.enableEvalNormalization);
+    ctx->setIncrementalRebuildInterval(options_.nativeRebuildEveryNEvals);
+  }
+}
+
+void UciProtocol::initTablebase() {
+  if (!options_.tbPath.empty()) {
+    Tablebase::init(options_.tbPath);
+  }
+}
+
+void UciProtocol::loadBooks() {
+  if (!options_.bookPath.empty()) {
+    book_ = std::make_unique<PolyglotBook>(options_.bookPath);
+    if (book_) book_->load();
+  } else {
+    book_.reset();
+  }
+  
+  if (!options_.bookPath2.empty()) {
+    book2_ = std::make_unique<PolyglotBook>(options_.bookPath2);
+    if (book2_) book2_->load();
+  } else {
+    book2_.reset();
+  }
+}
+
+void UciProtocol::setTTDisabled(bool disable) {
+  tt_.setDisabled(disable);
 }

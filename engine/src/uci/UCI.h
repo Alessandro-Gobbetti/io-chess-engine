@@ -1,6 +1,14 @@
 #pragma once
-// UCI.h - Universal Chess Interface protocol implementation
-// Handles communication with claim GUIs
+
+/**
+ * @file UCI.h
+ * @brief Universal Chess Interface protocol implementation.
+ *
+ * Handles communication between the engine and external GUIs (e.g., Cutechess).
+ * Parses standard UCI commands and drives the underlying search and evaluation components.
+ */
+
+#include "UciOptions.h"
 
 #include "../Types.h"
 #include "../book/polyglot_book.hpp"
@@ -22,11 +30,18 @@
 // Engine constant for versioning
 static constexpr const char *ENGINE_VERSION = "1.0";
 
+/**
+ * @class UciProtocol
+ * @brief Main engine controller implementing the UCI protocol.
+ *
+ * Orchestrates parsing input from standard input, managing engine options,
+ * starting/stopping search threads, and reporting results to standard output.
+ */
 class UciProtocol {
 private:
   // Engine name and author
   static constexpr const char *ENGINE_NAME = "io-chess-engine";
-  static constexpr const char *ENGINE_AUTHOR = "Alessandro Gobbetti";
+  static constexpr const char *ENGINE_AUTHOR = "Alessandro Gobbetti!";
 
   // Persistent Resources (loaded once)
   std::vector<std::unique_ptr<Evaluator>> evaluators_;
@@ -37,62 +52,60 @@ private:
   // Threading and Search State
   std::vector<std::thread> threadPool_;
   std::shared_ptr<SearchSharedData> searchData_;
-  int numThreads_ = 1;
-  int evalThreads_ = 0; // 0 = Auto
 
   // The active search algorithm
   std::unique_ptr<ISearch> searcher_;
   std::thread searchThread_;
   std::atomic<bool> searchRunning_{false};
+  std::atomic<bool> searchMayRunForever_{false};
   std::atomic<bool> pondering_{false};
   std::atomic<bool> ponderResultReady_{false};
   Move ponderResultMove_{};
-  Move ponderMove_{}; // Expected opponent reply (2nd move in PV)
-  SearchParams ponderParams_{}; // Time params from go ponder for ponderhit use
+  Move ponderMove_{}; ///< Expected opponent reply (2nd move in PV)
+  SearchParams ponderParams_{}; ///< Time params from go ponder for ponderhit use
   std::mutex ponderMutex_;
 
   // Current position
   Board currentBoard_;
 
   // Options
-  std::string modelPath_;
-  std::string tbPath_;    // Tablebase path
-  std::string bookPath_;  // Opening book path
-  std::string bookPath2_; // Secondary opening book path
+  UciOptions options_;
   std::unique_ptr<PolyglotBook> book2_;
   int consecutiveBookMisses_ = 0;
   static constexpr int MAX_BOOK_MISSES = 3;
-  size_t hashSizeMB_ = 128;
-  bool useMCTS_ = false;
-  bool useSimpleEval_ = false; // If true, use simple eval; if false, use NN
-  bool useBook_ = true;
-  bool analyseMode_ = false; // If true, probe book but don't halt search
-  bool useGPU_ = false; // Simplified from ExecutionProvider
-  bool chess960_ = false; // Chess960/FRC mode
-  float aggression_ =
-      0.0f; // WDL conversion aggression: -1.0 (defensive) to +1.0 (aggressive)
-  int lazyEvalMaxDepth_ = 6;
-  int lazyEvalBaseMargin_ = 500;
-  int lazyEvalDepthMargin_ = 100;
-  bool enableLazyEval_ = true;
-  int evalScaleBase_ = 750;
-  int evalScaleWeight_ = 25;
-  bool enableEvalNormalization_ = true;
-  SearchSharedData::SearchConfig searchConfig_;
-  
-  // Tree Export Options
-  bool exportTree_ = false;
-  int exportTreeDepth_ = 4;
+
+  std::string pendingTTLoadFile_;
+  uint64_t ttSnapshotCounter_ = 0;
+
+  // Per-search metric baselines (used to report deltas in info lines)
+  uint64_t searchBaseFullRebuilds_ = 0;
+  uint64_t searchBaseTbHits_ = 0;
+  uint64_t searchBaseTtHits_ = 0;
 
 public:
+  /**
+   * @brief Constructs the UCI Protocol handler.
+   */
   explicit UciProtocol(const std::string &modelPath, bool useSimpleEval = false,
                        const std::string &tbPath = "",
                        const std::string &bookPath = "",
                        const std::string &bookPath2 = "", int evalThreads = 0);
   ~UciProtocol();
 
-  // Main command loop (blocking)
+  /**
+   * @brief The main blocking loop that reads commands from standard input.
+   */
   void loop();
+
+  // Callbacks for options
+  void resizeHash(size_t mb);
+  void updateThreads(int numThreads);
+  void reinitEngine();
+  void updateEvalContexts();
+  void initTablebase();
+  void loadBooks();
+  void setTTDisabled(bool disable);
+  void setPendingTTLoadFile(const std::string& file) { pendingTTLoadFile_ = file; }
 
 private:
   // UCI command handlers
@@ -112,5 +125,7 @@ private:
   static std::string formatScore(int score);
   void sendInfo(int depth, int score, int nodes, int nps,
                 const std::vector<Move> &pv, const Board &board);
-  void sendBestMove(Move move, Move ponderMove = Move());
+  void sendBestMove(Move move, Move ponderMove = Move(Move::NO_MOVE));
+  void saveTTSnapshotForMove(const std::string &moveUci);
+  static std::string sanitizeForFilename(const std::string &value);
 };

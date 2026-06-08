@@ -1,5 +1,10 @@
-// main.cpp - Chess Engine Entry Point
-// Usage: ./chess_engine [--model <path>] [--syzygy <path>]
+/**
+ * @file main.cpp
+ * @brief Chess Engine Entry Point.
+ *
+ * Initializes the chess engine and handles command line arguments to
+ * start the UCI protocol interface.
+ */
 
 #include "uci/UCI.h"
 #include <cstring>
@@ -9,8 +14,8 @@
 void printUsage(const char *programName) {
   std::cerr << "Usage: " << programName << " [options]" << std::endl;
   std::cerr << "Options:" << std::endl;
-  std::cerr << "  --model <path>    Path to ONNX model file (required for "
-               "Neural eval)"
+  std::cerr << "  --model <path>    Path to native model bundle directory "
+               "(must contain native_weights.bin; required for Neural eval)"
             << std::endl;
   std::cerr << "  --simple-eval     Use simple evaluation (no model needed)"
             << std::endl;
@@ -26,14 +31,8 @@ void printUsage(const char *programName) {
 }
 
 int main(int argc, char *argv[]) {
-  // setenv("OMP_PROC_BIND", "false", 1);
-
-  // setenv("OMP_PROC_BIND", "false", 1);
-  
   unsigned int hwCores = std::thread::hardware_concurrency();
   std::cout << "info string Detected Hardware Cores: " << hwCores << std::endl;
-  std::string hwThreads = std::to_string(hwCores);
-  // setenv("TBB_NUM_THREADS", hwThreads.c_str(), 1);
 
   std::string modelPath;
   bool useSimpleEval = false;
