@@ -1,195 +1,241 @@
+"""
+@file model.py
+@brief Lightweight MoE Model for Chess Evaluation (Factorized Cache Architecture).
+
+RULES FOR C++ PERFORMANCE:
+1. NO 3x3 CONVOLUTIONS AFTER THE MIXER. (Preserves spatial caching).
+2. Dense layers must be protected by a 1x1 bottleneck to minimize Flat size.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# =============================================================================
-#   BUILDING BLOCKS
-# =============================================================================
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation Block for channel-wise attention."""
-    def __init__(self, channels, reduction=16):
-        super(SEBlock, self).__init__()
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1) # Squeeze: (Batch, C, 8, 8) -> (Batch, C, 1, 1)
-        
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=True), # Compress
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=True), # Expand
-            nn.Sigmoid() # Importance Score (0.0 to 1.0)
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.global_avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y  # Scale the input features
-
-class ResidualBlockSE(nn.Module):
-    """ResNet Block with Squeeze-and-Excitation."""
-    def __init__(self, channels, reduction=16):
-        super(ResidualBlockSE, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.se = SEBlock(channels, reduction)
-
-    def forward(self, x):    
-        residual = x
-        # Standard ResNet pass
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        # Squeeze-and-Excitation
-        out = self.se(out)
-        out += residual
-        return F.relu(out)
-    
-
-class SelfAttentionBlock(nn.Module):
-    """Spatial Self-Attention using Multi-Head Attention."""
-    def __init__(self, channels, num_heads=4):
+class PieceBranch(nn.Module):
+    """
+    The deep, cacheable spatial logic for a single piece type.
+    Because these are computed BEFORE the mixer, they only cost CPU cycles
+    when the specific piece type moves.
+    """
+    def __init__(self, in_channels, mid_channels=16):
         super().__init__()
-        self.channels = channels
-        self.num_heads = num_heads
-
-        # MultiHeadAttention expects (seq, batch, dim)
-        self.mha = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=num_heads,
-            batch_first=False  # -> (S,B,C)
-        )
-
-        self.ln = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        # Flatten: (B, C, H, W) -> (S=64, B, C) for MHA
-        tokens_raw = x.view(B, C, -1).permute(2, 0, 1)
-
-        # Pre-Norm architecture
-        tokens_norm = self.ln(tokens_raw)
-
-        # Self-Attention
-        attn_out, _ = self.mha(tokens_norm, tokens_norm, tokens_norm)
-
-        # Residual connection
-        tokens = tokens_raw + attn_out
-
-        # Reshape back to (B, C, H, W)
-        out = tokens.permute(1, 2, 0).view(B, C, H, W)
-        return out
-
-
-# =============================================================================
-#   HEADS
-# =============================================================================
-class SpatialValueHead(nn.Module):
-    """Value Head that preserves spatial layout."""
-    def __init__(self, channels, hidden=256):
-        super().__init__()
-        # 1x1 Conv to reduce depth before flattening (saves params)
-        self.conv1 = nn.Conv2d(channels, 32, kernel_size=1) 
-        self.bn1 = nn.BatchNorm2d(32)
+        # Layer 0: 3x3 Conv
+        self.conv0 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1)
         
-        # Flatten: 32 channels * 64 squares = 2048 features
-        self.fc1 = nn.Linear(32 * 8 * 8, hidden)
-        self.fc2 = nn.Linear(hidden, 1)
+        # Layer 1: depthwise 3x3 Conv (groups=channels)
+        self.conv1 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            padding=1,
+            groups=mid_channels,
+        )
+        
+        # Layer 2: pointwise 1x1 Conv
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=1)
+        
+        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = x.flatten(start_dim=1) # Preserves spatial layout!
-        x = F.relu(self.fc1(x))
-        return torch.tanh(self.fc2(x))
-    
+        x = self.act(self.conv0(x))
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        return x
 
 
-# =============================================================================
-#   UTILITIES
-# =============================================================================
-
-def initialize_weights(m):
-    """Kaiming Initialization for Conv layers."""
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-    elif isinstance(m, nn.BatchNorm2d):
-        nn.init.constant_(m.weight, 1)
-        nn.init.constant_(m.bias, 0)
-
-
-# =============================================================================
-#   MAIN MODEL (The "Assembler")
-# =============================================================================
-
-class ChessNet(nn.Module):
+class LightExpert(nn.Module):
+    """
+    The ultra-fast Dense Expert. 
+    It compresses the massive Mixer output down to a small bottleneck before flattening.
+    """
     def __init__(
-        self, 
-        n_inputs=42,            # Number of input planes
-        n_filters=128,          # Width of the network
-        n_pre_blocks=3,         # Residual blocks BEFORE attention
-        n_post_blocks=2,        # Residual blocks AFTER attention
-        use_attention=True,     # Toggle for the Self-Attention block
-        init_weights=True       # Whether to initialize weights
+        self,
+        mixer_channels=64,
+        bottleneck_channels=32,
+        hidden_dim=128,
+        expert_pool="flat",
     ):
-        super(ChessNet, self).__init__()
-
-        # 1. Stem
-        self.stem = nn.Sequential(
-            nn.Conv2d(n_inputs, n_filters, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(n_filters),
-            nn.ReLU(inplace=True)
-        )
-
-        # 2. Dynamic Body Construction
-        blocks = []
+        super().__init__()
+        if expert_pool not in {"flat", "gap", "pool2avg", "pool2max"}:
+            raise ValueError(
+                "expert_pool must be one of: flat, gap, pool2avg, pool2max"
+            )
+        self.expert_pool = expert_pool
         
-        # A. Add Pre-Attention Residual Blocks
-        for _ in range(n_pre_blocks):
-            blocks.append(ResidualBlockSE(n_filters))
+        # 1x1 Bottleneck Compressor (e.g., 64 -> 32 channels)
+        self.head_conv = nn.Conv2d(mixer_channels, bottleneck_channels, kernel_size=1)
+        self.head_act = nn.ReLU(inplace=True)
+
+        if expert_pool == "flat":
+            hidden_in = bottleneck_channels * 64
+        elif expert_pool == "gap":
+            hidden_in = bottleneck_channels
+        else:
+            hidden_in = bottleneck_channels * 16
+
+        # Fast Dense Layer after chosen pooling path.
+        self.head_hidden = nn.Linear(hidden_in, hidden_dim)
+        self.head_act2 = nn.ReLU(inplace=True)
+        
+        # Outputs
+        self.head_wdl = nn.Linear(hidden_dim, 3)
+    
+    def forward(self, x):
+        # Compress & ReLU
+        x = self.head_act(self.head_conv(x))
+
+        if self.expert_pool == "flat":
+            x = torch.flatten(x, start_dim=1)
+        elif self.expert_pool == "gap":
+            x = x.mean(dim=(2, 3))
+        elif self.expert_pool == "pool2avg":
+            x = F.avg_pool2d(x, kernel_size=2, stride=2)
+            x = torch.flatten(x, start_dim=1)
+        else:
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+            x = torch.flatten(x, start_dim=1)
+
+        # Dense Math
+        x = self.head_act2(self.head_hidden(x))
+
+        # Per-expert softmax WDL.
+        wdl = F.softmax(self.head_wdl(x), dim=1)
+        return wdl
+
+
+class ChessNetFactorizedMoE(nn.Module):
+    # Channel counts per branch (Rich setup):
+    # Pawns/Kings/Knights=4, Sliders=5 (x-ray).
+    # Order: WP, WN, WB, WR, WQ, WK, BP, BN, BB, BR, BQ, BK
+    PLANES_PER_TYPE = [4, 4, 5, 5, 5, 4, 4, 4, 5, 5, 5, 4]
+
+    def __init__(self, 
+                 n_globals=21, 
+                 branch_dim=16, 
+                 mixer_out=64, 
+                 n_bypass=12, 
+                 n_experts=4,
+                 expert_bottleneck=32,
+                 expert_hidden=128,
+                 expert_pool="flat"):
+        super().__init__()
+        if expert_pool not in {"flat", "gap", "pool2avg", "pool2max"}:
+            raise ValueError(
+                "expert_pool must be one of: flat, gap, pool2avg, pool2max"
+            )
+        self.expert_pool = expert_pool
+        self.n_experts = n_experts
+        
+        # 1. The 12 Independent Piece Branches
+        self.branches = nn.ModuleList([
+            PieceBranch(in_channels=in_ch, mid_channels=branch_dim) 
+            for in_ch in self.PLANES_PER_TYPE
+        ])
+        
+        # 2. The Pointwise Mixer (Delta-Accumulator target)
+        mixer_in_channels = (12 * branch_dim) + n_bypass
+        self.pointwise_mixer = nn.Conv2d(mixer_in_channels, mixer_out, kernel_size=1)
+        
+        # 3. Global Scalar Injection
+        self.stem_global = nn.Linear(n_globals, mixer_out)
+        
+        self.mixer_act = nn.ReLU(inplace=True)
+        
+        # 4. The Experts
+        self.experts = nn.ModuleList([
+            LightExpert(
+                mixer_channels=mixer_out, 
+                bottleneck_channels=expert_bottleneck, 
+                hidden_dim=expert_hidden,
+                expert_pool=expert_pool,
+            ) for _ in range(n_experts)
+        ])
+
+    def forward(self, *inputs, weights=None):
+        if len(inputs) == 3 and isinstance(inputs[0], (list, tuple)):
+            planes_list, bypass, global_v = inputs
+        elif len(inputs) == 14:
+            planes_list = list(inputs[:12])
+            bypass = inputs[12]
+            global_v = inputs[13]
+        else:
+            raise ValueError(
+                "Expected either (planes_list, bypass, global_v) or 14 tensor inputs "
+                "(12 piece planes, bypass, global_v)."
+            )
+
+        # 1. Evaluate Branches (In C++, 90% of these are skipped and fetched from cache)
+        branch_outs = []
+        for i, branch in enumerate(self.branches):
+            branch_outs.append(branch(planes_list[i]))
             
-        # B. Add Optional Attention Block
-        if use_attention:
-            blocks.append(SelfAttentionBlock(n_filters))
+        # 2. Concatenate Branches + Bypass Lanes
+        x = torch.cat(branch_outs + [bypass], dim=1)
+        
+        # 3. Pointwise Mixer
+        x = self.pointwise_mixer(x)
+        
+        # 4. Inject Globals and apply ReLU
+        g = self.stem_global(global_v).view(-1, x.shape[1], 1, 1)
+        x = self.mixer_act(x + g)
+
+        # 5) Evaluate all experts.
+        expert_wdl = []
+        for expert in self.experts:
+            w = expert(x)
+            expert_wdl.append(w)
+        expert_wdl = torch.stack(expert_wdl, dim=1)  # [B, E, 3]
+
+        # 6) Mixture routing: callers should provide expert weights.
+        # If omitted (e.g. simple smoke tests), fall back to uniform mixing.
+        w = weights
+        if w is None:
+            w = torch.full(
+                (expert_wdl.size(0), self.n_experts),
+                1.0 / float(self.n_experts),
+                dtype=expert_wdl.dtype,
+                device=expert_wdl.device,
+            )
+        if w.dim() == 1:
+            w = w.unsqueeze(0)
+        if w.size(1) != self.n_experts:
+            raise ValueError(
+                f"weights must have shape [B, {self.n_experts}] or [{self.n_experts}]"
+            )
+        wdl_out = (expert_wdl * w.unsqueeze(-1)).sum(dim=1)
             
-        # C. Add Post-Attention Residual Blocks
-        for _ in range(n_post_blocks):
-            blocks.append(ResidualBlockSE(n_filters))
-
-        # Register the list of layers as a Sequential module
-        self.tower = nn.Sequential(*blocks)
-
-        # 3. Value Head
-        self.value_head = SpatialValueHead(n_filters)
-
-        # 4. Initialize Weights
-        if init_weights:
-            self.apply(initialize_weights)
-
-    def forward(self, board):
-        x = self.stem(board)
-        x = self.tower(x)
-        return self.value_head(x)
+        return wdl_out
+    
 
 
-# =============================================================================
-#   SANITY CHECK: Run this block to verify the model works.
-# =============================================================================
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ChessNet().to(device)
+    # Quick test to verify dimensions and forward pass
+    model = ChessNetFactorizedMoE(expert_bottleneck=16, mixer_out=512)
+    model.eval()
     
-    # Create a dummy batch: (Batch=2, Channels=42, Height=8, Width=8)
-    dummy_input = torch.randn(2, 42, 8, 8).to(device)
-    
-    print(f"Model created on {device}")
-    
-    # Calculate parameter count
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total Parameters: {params:,}")
-    
-    # Test Forward Pass
-    output = model(dummy_input)
-    print(f"Input Shape: {dummy_input.shape}")
-    print(f"Output Shape: {output.shape}") # Should be (2, 1)
-    print("Output Values:", output.detach().cpu().numpy())
+    # Dummy input data
+    planes_list = [torch.randn(1, in_ch, 8, 8) for in_ch in ChessNetFactorizedMoE.PLANES_PER_TYPE]
+    bypass = torch.randn(1, 12, 8, 8)
+    global_v = torch.randn(1, 21)
+
+
+    # print number of parameters    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total Parameters: {sum(p.numel() for p in model.parameters())}")
+    wdl = model(planes_list, bypass, global_v)
+    print("WDL Output Shape:", wdl.shape)  # Expected: (1, 3)
+
+    # printing number of parameters in each part
+    print("\nParameter Counts:")
+    total_params = sum(p.numel() for p in model.parameters())
+    branches_params = sum(p.numel() for n, p in model.named_parameters() if "branches" in n)
+    stem_global_params = sum(p.numel() for n, p in model.named_parameters() if "stem_global" in n)
+    pointwise_mixer_params = sum(p.numel() for n, p in model.named_parameters() if "pointwise_mixer" in n)
+    backbone_params = sum(p.numel() for n, p in model.named_parameters() if "branches" in n or "pointwise_mixer" in n or "stem_global" in n)
+    expert_params = sum(p.numel() for n, p in model.named_parameters() if "experts" in n)
+    print(f"  Total: {total_params}")
+    print(f"  Branches: {branches_params} ({branches_params/total_params:.2%})")
+    print(f"  Stem Global: {stem_global_params} ({stem_global_params/total_params:.2%})")
+    print(f"  Pointwise Mixer: {pointwise_mixer_params} ({pointwise_mixer_params/total_params:.2%})")
+    print(f"  Backbone (Branches + Mixer + Stem): {backbone_params} ({backbone_params/total_params:.2%})")
+    print(f"  Experts: {expert_params} ({expert_params/total_params:.2%})")

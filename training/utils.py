@@ -1,3 +1,10 @@
+"""
+@file utils.py
+@brief Training utility functions.
+
+Provides helper scripts for setting random seeds, console coloring, and logging.
+"""
+
 import random
 import numpy as np
 import torch

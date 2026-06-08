@@ -1,69 +1,56 @@
 """
-Loss functions for Residual MoE training.
+@file loss.py
+@brief Loss functions for training the chess neural network.
 
-Three loss types:
-  - BASE: Standard WDL + Mate loss for base experts
-  - KILLER: Zoomed WDL (focus on winning positions)
-  - SURVIVOR: Zoomed WDL (focus on defensive positions)
+Provides functions to compute custom loss metrics combining Win-Draw-Loss (WDL)
+probabilities and regularization penalties.
 """
+
+# Loss functions for Residual MoE training.
+#
+# Three loss types:
+#   - BASE: Standard WDL loss for base experts
+#   - KILLER: Zoomed WDL (focus on winning positions)
+#   - SURVIVOR: Zoomed WDL (focus on defensive positions)
 
 import torch
 import torch.nn.functional as F
 
 
-def base_loss(pred_wdl, pred_mate, target_wdl, target_mate, wdl_weight=1.0, mate_weight=0.5):
+def base_loss_components(
+    pred_wdl,
+    target_wdl,
+    wdl_weight=1.0,
+):
     """
     Standard loss for base experts (Tactical, Strategic, Major End, Minor End).
     
-    WDL is the primary objective. Mate distance only matters when there's
-    an actual mate in the position (target_mate > 0).
+    WDL is the primary objective using Brier-style MSE.
     
     Args:
         pred_wdl: [B, 3] predicted WDL probabilities (from softmax)
-        pred_mate: [B, 1] predicted mate distance
         target_wdl: [B, 3] target WDL probabilities
-        target_mate: [B, 1] target mate distance (0.0 if no mate, >0 if mate exists)
         
     Returns:
-        Scalar loss
+        (total_loss, weighted_wdl_loss)
     """
-    # Cross-entropy loss for soft WDL targets (more stable than KL div)
-    # CE = -sum(target * log(pred))
-    log_pred = torch.log(pred_wdl + 1e-8)
-    loss_wdl = -torch.sum(target_wdl * log_pred, dim=1).mean()
+    # Brier-style MSE on soft WDL targets.
+    loss_wdl = F.mse_loss(pred_wdl, target_wdl, reduction='mean')
     
-    # Conditional mate loss: only when there's actually a mate
-    # Create mask for positions with mate (target_mate > 0)
-    # Create mask for positions with mate (target_mate > 0)
-    mate_mask = (target_mate > 0.01).float()  # Small threshold for numerical stability
-    non_mate_mask = 1.0 - mate_mask
-    n_mate_positions = mate_mask.sum()
-    n_non_mate = non_mate_mask.sum()
-    
-    # 1. Positive Mate Loss (MSE on actual mates)
-    if n_mate_positions > 0:
-        masked_pred = pred_mate * mate_mask
-        masked_target = target_mate * mate_mask
-        loss_pos = F.mse_loss(masked_pred, masked_target, reduction='sum') / (n_mate_positions + 1e-8)
-    else:
-        loss_pos = torch.tensor(0.0, device=pred_wdl.device)
-        
-    # 2. Negative Mate Loss (Suppress false mates)
-    # We want pred_mate -> 0 when no mate exists
-    if n_non_mate > 0:
-        # Target is 0, so just MSE(pred, 0) -> pred^2
-        # Use small weight (0.1) to avoid overwhelming WDL signal
-        masked_pred_neg = pred_mate * non_mate_mask
-        loss_neg = (masked_pred_neg).pow(2).sum() / (n_non_mate + 1e-8)
-    else:
-        loss_neg = torch.tensor(0.0, device=pred_wdl.device)
-    
-    loss_mate = loss_pos + 0.1 * loss_neg
-    
-    return wdl_weight * loss_wdl + mate_weight * loss_mate
+    weighted_wdl = wdl_weight * loss_wdl
+    return weighted_wdl, weighted_wdl
 
 
-def killer_loss(pred_wdl, pred_mate, target_wdl, target_mate, wdl_weight=1.0, mate_weight=5.0):
+def base_loss(pred_wdl, target_wdl, wdl_weight=1.0):
+    total, _ = base_loss_components(
+        pred_wdl,
+        target_wdl,
+        wdl_weight=wdl_weight,
+    )
+    return total
+
+
+def killer_loss(pred_wdl, target_wdl, wdl_weight=1.0):
     """
     Zoomed loss for Killer expert (winning positions).
     
@@ -96,32 +83,10 @@ def killer_loss(pred_wdl, pred_mate, target_wdl, target_mate, wdl_weight=1.0, ma
     log_pred = torch.log(pred_wdl + 1e-8)
     loss_wdl = -torch.sum(new_target * log_pred, dim=1).mean()
     
-    # Conditional mate loss: killer WANTS to find mate, so high weight when mate exists
-    mate_mask = (target_mate > 0.01).float()
-    non_mate_mask = 1.0 - mate_mask
-    n_mate_positions = mate_mask.sum()
-    n_non_mate = non_mate_mask.sum()
-    
-    if n_mate_positions > 0:
-        masked_pred = pred_mate * mate_mask
-        masked_target = target_mate * mate_mask
-        loss_pos = F.smooth_l1_loss(masked_pred, masked_target, reduction='sum') / (n_mate_positions + 1e-8)
-    else:
-        loss_pos = torch.tensor(0.0, device=pred_wdl.device)
-        
-    if n_non_mate > 0:
-        # Suppress false mates in killer positions too
-        masked_pred_neg = pred_mate * non_mate_mask
-        loss_neg = (masked_pred_neg).pow(2).sum() / (n_non_mate + 1e-8)
-    else:
-        loss_neg = torch.tensor(0.0, device=pred_wdl.device)
-        
-    loss_mate = loss_pos + 0.1 * loss_neg
-    
-    return wdl_weight * loss_wdl + mate_weight * loss_mate
+    return wdl_weight * loss_wdl
 
 
-def survivor_loss(pred_wdl, pred_mate, target_wdl, target_mate, wdl_weight=1.0, mate_weight=1.0):
+def survivor_loss(pred_wdl, target_wdl, wdl_weight=1.0):
     """
     Zoomed loss for Survivor expert (losing positions).
     
@@ -158,30 +123,7 @@ def survivor_loss(pred_wdl, pred_mate, target_wdl, target_mate, wdl_weight=1.0, 
     log_pred = torch.log(pred_wdl + 1e-8)
     loss_wdl = -torch.sum(new_target * log_pred, dim=1).mean()
     
-    # Conditional mate loss: survivor cares about mate only to AVOID it
-    # When being mated, we want to predict mate distance to understand threat level
-    mate_mask = (target_mate > 0.01).float()
-    non_mate_mask = 1.0 - mate_mask
-    n_mate_positions = mate_mask.sum()
-    n_non_mate = non_mate_mask.sum()
-    
-    if n_mate_positions > 0:
-        masked_pred = pred_mate * mate_mask
-        masked_target = target_mate * mate_mask
-        loss_pos = F.smooth_l1_loss(masked_pred, masked_target, reduction='sum') / (n_mate_positions + 1e-8)
-    else:
-        loss_pos = torch.tensor(0.0, device=pred_wdl.device)
-        
-    if n_non_mate > 0:
-        # Suppress false mates
-        masked_pred_neg = pred_mate * non_mate_mask
-        loss_neg = (masked_pred_neg).pow(2).sum() / (n_non_mate + 1e-8)
-    else:
-        loss_neg = torch.tensor(0.0, device=pred_wdl.device)
-        
-    loss_mate = loss_pos + 0.1 * loss_neg
-    
-    return wdl_weight * loss_wdl + mate_weight * loss_mate
+    return wdl_weight * loss_wdl
 
 
 def gater_loss(pred_gates, target_gates):
@@ -198,23 +140,21 @@ def gater_loss(pred_gates, target_gates):
     return F.mse_loss(pred_gates, target_gates)
 
 
-def moe_loss(pred_wdl, pred_mate, target_wdl, target_mate, expert_type='BASE'):
+def moe_loss(pred_wdl, target_wdl, expert_type='BASE'):
     """
     Unified loss function with expert type selection.
     
     Args:
         pred_wdl: [B, 3]
-        pred_mate: [B, 1]
         target_wdl: [B, 3]
-        target_mate: [B, 1]
         expert_type: 'BASE', 'KILLER', or 'SURVIVOR'
     """
     if expert_type == 'BASE':
-        return base_loss(pred_wdl, pred_mate, target_wdl, target_mate)
+        return base_loss(pred_wdl, target_wdl)
     elif expert_type == 'KILLER':
-        return killer_loss(pred_wdl, pred_mate, target_wdl, target_mate)
+        return killer_loss(pred_wdl, target_wdl)
     elif expert_type == 'SURVIVOR':
-        return survivor_loss(pred_wdl, pred_mate, target_wdl, target_mate)
+        return survivor_loss(pred_wdl, target_wdl)
     else:
         raise ValueError(f"Unknown expert_type: {expert_type}")
 
@@ -227,13 +167,11 @@ if __name__ == "__main__":
     
     B = 8
     pred_wdl = F.softmax(torch.randn(B, 3), dim=1)
-    pred_mate = torch.sigmoid(torch.randn(B, 1))
     target_wdl = F.softmax(torch.randn(B, 3), dim=1)
-    target_mate = torch.rand(B, 1)
     
     # Test each loss type
     for expert_type in ['BASE', 'KILLER', 'SURVIVOR']:
-        loss = moe_loss(pred_wdl, pred_mate, target_wdl, target_mate, expert_type)
+        loss = moe_loss(pred_wdl, target_wdl, expert_type)
         print(f"{expert_type:10} loss: {loss.item():.4f}")
     
     # Test gater loss
