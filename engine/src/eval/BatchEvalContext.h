@@ -1,3 +1,8 @@
+/**
+ * @file BatchEvalContext.h
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #pragma once
 // BatchEvalContext.h - Wrapper for search threads to use BatchEvaluator
 // Provides the same IEvaluator interface but submits to batch queue
@@ -14,7 +19,8 @@ public:
       : batchEvaluator_(batchEval) {}
 
   // Submit to batch queue and wait for result
-  float evaluate(const Board &board) override {
+  float evaluate(const Board &board, int ply = 0) override {
+    (void)ply;
     auto future = batchEvaluator_.submit(board);
     return future.get(); // Block until result is ready
   }
