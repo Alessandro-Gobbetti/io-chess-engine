@@ -1,4 +1,10 @@
+/**
+ * @file Negamax.cpp
+ * @brief Missing description.
+ * @ingroup engine
+ */
 #include "Negamax.h"
+#include "TablebaseFallback.h"
 #include "../tablebases/Tablebase.h"
 #include "FeatureExtractor.hpp" // For game phase extraction
 #include <algorithm>
@@ -9,294 +15,7 @@
 using namespace SearchConstants;
 using namespace MoveOrderConstants;
 
-// ============================================================================
-//   MovePicker Implementation
-// ============================================================================
 
-int MovePicker::scoreMove(const Move &move, const Board &board,
-                          const Negamax *search, bool isCapture) {
-  if (isCapture) {
-    // Promotion bonus: prioritize promotions over regular captures
-    int promoBonus = 0;
-    if (move.typeOf() == Move::PROMOTION) {
-      PieceType pt = move.promotionType();
-      if (pt == PieceType::QUEEN) {
-        promoBonus = 400;
-      } else if (pt == PieceType::ROOK) {
-        promoBonus = 200;
-      } else if (pt == PieceType::BISHOP || pt == PieceType::KNIGHT) {
-        promoBonus = 100;
-      }
-    }
-
-    // MVV-LVA for captures
-    Piece captured;
-    if (move.typeOf() == Move::ENPASSANT) {
-      captured = Piece(PieceType::PAWN, board.sideToMove() == Color::WHITE
-                                            ? Color::BLACK
-                                            : Color::WHITE);
-    } else {
-      captured = board.at(move.to());
-    }
-    Piece attacker = board.at(move.from());
-
-    int toSq = move.to().index();
-    int capturedType =
-        (captured == Piece::NONE) ? 0 : static_cast<int>(captured.type());
-    int attackerType = static_cast<int>(attacker.type());
-
-    // Add Capture History score
-    int capHistory = (*captureHist_)[attackerType][toSq];
-
-    return static_cast<int16_t>(CAPTURE_BASE + promoBonus + capturedType * 10 +
-                                (capHistory / 128) -
-                                attackerType);
-  } else {
-    // Quiet moves: history score + thread-based diversity
-    int fromSq = move.from().index();
-    int toSq = move.to().index();
-    int baseScore = (*history_)[fromSq][toSq];
-    int piece = static_cast<int>(board.at(move.from()));
-
-    if (ply_ >= 1) {
-      Move prev1 = search->prevMove_[ply_ - 1];
-      if (prev1 != Move(0)) {
-        int pPiece1 = static_cast<int>(search->prevPiece_[ply_ - 1]);
-        int pTo1 = prev1.to().index();
-        baseScore += search->h_->contHist_[pPiece1][pTo1][piece][toSq];
-      }
-    }
-    if (ply_ >= 2) {
-      Move prev2 = search->prevMove_[ply_ - 2];
-      if (prev2 != Move(0)) {
-        int pPiece2 = static_cast<int>(search->prevPiece_[ply_ - 2]);
-        int pTo2 = prev2.to().index();
-        baseScore += search->h_->contHist_[pPiece2][pTo2][piece][toSq];
-      }
-    }
-    if (ply_ >= 4) {
-      Move prev4 = search->prevMove_[ply_ - 4];
-      if (prev4 != Move(0)) {
-        int pPiece4 = static_cast<int>(search->prevPiece_[ply_ - 4]);
-        int pTo4 = prev4.to().index();
-        baseScore += search->h_->contHist_[pPiece4][pTo4][piece][toSq];
-      }
-    }
-
-    return static_cast<int16_t>(baseScore);
-  }
-}
-
-Move MovePicker::nextMove(const Board &board, const Negamax *search,
-                          bool inCheck) {
-  // Phase 0: Queen promotions first (highest priority)
-  if (phase_ == 0) {
-    for (; nextQueenPromo_ < static_cast<int>(allMoves_.size()); ++nextQueenPromo_) {
-      const auto &move = allMoves_[nextQueenPromo_];
-      if (move.typeOf() == Move::PROMOTION &&
-          move.promotionType() == PieceType::QUEEN) {
-        nextQueenPromo_++; 
-    return move;
-      }
-    }
-    phase_ = 1;
-  }
-
-  // Phase 1: Return TT move (if legal and not already returned)
-  if (phase_ == 1) {
-    phase_ = 2;
-    if (ttMove_ != Move(0)) {
-      bool alreadyReturned = (ttMove_.typeOf() == Move::PROMOTION &&
-                              ttMove_.promotionType() == PieceType::QUEEN);
-      if (!alreadyReturned) {
-        // Validate it is actually a legal move in this position
-        for (const auto &m : allMoves_) {
-          if (m == ttMove_) return ttMove_;
-        }
-      }
-    }
-  }
-
-  // Phase 2: Good Captures
-  if (phase_ == 2) {
-    if (!capturesGenerated_) {
-      generateAndScoreCaptures(board, search);
-      capturesGenerated_ = true;
-    }
-    
-    // Select captures in order, but defer bad ones using SEE
-    while (nextCapture_ < captureCount_) {
-      Move move = selectBestMove(captures_, captureScores_, nextCapture_, captureCount_);
-      
-      // Skip TT move if it was already returned
-      if (move == ttMove_) continue;
-
-      // We will use 0 here (strict no-loss).
-      if (search->see(board, move) >= 0) {
-    return move;
-      } else {
-        // Defer this capture until the very end
-        badCaptures_[badCaptureCount_++] = move;
-      }
-    }
-    phase_ = 3;
-  }
-
-  // Phase 3: Killer moves (quiet moves that recently caused cutoffs)
-  if (phase_ == 3) {
-    if (!killersGenerated_) {
-      generateAndScoreKillers(board, search);
-      killersGenerated_ = true;
-    }
-    while (nextKiller_ < killerCount_) {
-      Move move = killerMoves_[nextKiller_++];
-      if (move != ttMove_) return move;
-    }
-    phase_ = 4;
-  }
-
-  // Phase 4: Countermove
-  if (phase_ == 4 && !countermoveReturned_) {
-    countermoveReturned_ = true;
-    if (countermove_ != Move(0) && countermove_ != ttMove_) {
-      Move k1 = (*killers_)[ply_][0];
-      Move k2 = (*killers_)[ply_][1];
-      if (countermove_ != k1 && countermove_ != k2) {
-        for (const auto &m : allMoves_) {
-          if (m == countermove_) return countermove_;
-        }
-      }
-    }
-  }
-
-  // Phase 5: Quiets
-  if (phase_ == 4 || phase_ == 5) {
-    phase_ = 5; // Ensure we stick to phase 5 if we fall through
-    if (!quietsGenerated_) {
-      generateAndScoreQuiets(board, search);
-      quietsGenerated_ = true;
-    }
-    while (nextQuiet_ < quietCount_) {
-      Move move = selectBestMove(quiets_, quietScores_, nextQuiet_, quietCount_);
-      
-      // Skip moves already returned
-      if (move == ttMove_ || move == countermove_) continue;
-      bool isKiller = false;
-      for (int i = 0; i < killerCount_; ++i) {
-        if (move == killerMoves_[i]) {
-          isKiller = true;
-          break;
-        }
-      }
-      if (isKiller) continue;
-
-    return move;
-    }
-    phase_ = 6;
-  }
-
-  // Phase 6: Bad Captures (Deferred from Phase 2)
-  if (phase_ == 6) {
-    while (nextBadCapture_ < badCaptureCount_) {
-      Move move = badCaptures_[nextBadCapture_++];
-      // Skip TT move (though it should have been good anyway)
-      if (move != ttMove_) return move;
-    }
-  }
-
-    return Move(0);
-}
-
-
-void MovePicker::generateAndScoreCaptures(const Board &board,
-                                          const Negamax *search) {
-  // Single pass: classify into captures, killers, quiets to avoid multiple
-  // scans
-  if (capturesGenerated_ && quietsGenerated_ && killersGenerated_)
-    return;
-
-  Move k1 = (*killers_)[ply_][0];
-  Move k2 = (*killers_)[ply_][1];
-
-  for (const auto &move : allMoves_) {
-    if (move == ttMove_)
-      continue;
-
-    bool isCap = search->isCapture(board, move);
-    if (isCap) {
-      if (captureCount_ < MAX_MOVES) {
-        captureScores_[captureCount_] = scoreMove(move, board, search, true);
-        captures_[captureCount_] = move;
-        captureCount_++;
-      }
-      continue;
-    }
-
-    bool isKiller = (move == k1 || move == k2);
-    if (isKiller) {
-      // Deduplicate in case k1 == k2
-      bool alreadyAdded = false;
-      for (int i = 0; i < killerCount_; ++i) {
-        if (killerMoves_[i] == move) {
-          alreadyAdded = true;
-          break;
-        }
-      }
-      if (!alreadyAdded && killerCount_ < 2) {
-        killerMoves_[killerCount_++] = move;
-      }
-      continue;
-    }
-
-    if (quietCount_ < MAX_MOVES) {
-      quietScores_[quietCount_] = scoreMove(move, board, search, false);
-      quiets_[quietCount_] = move;
-      quietCount_++;
-    }
-  }
-
-  capturesGenerated_ = true;
-  killersGenerated_ = true;
-  quietsGenerated_ = true;
-}
-
-void MovePicker::generateAndScoreKillers(const Board &board,
-                                         const Negamax *search) {
-  if (killersGenerated_)
-    return;
-  // Fallback: classify everything now
-  generateAndScoreCaptures(board, search);
-}
-
-void MovePicker::generateAndScoreQuiets(const Board &board,
-                                        const Negamax *search) {
-  // Quiets are already populated during capture generation; guard for any
-  // legacy call
-  if (!quietsGenerated_) {
-    generateAndScoreCaptures(board, search);
-  }
-}
-
-// Template for fixed-size array selection
-template<size_t N>
-Move MovePicker::selectBestMove(std::array<Move, N> &list,
-                                std::array<int, N> &scores, int &nextIdx, int count) {
-  if (nextIdx >= count)
-    return Move(0);
-
-  // Find best starting from nextIdx
-  int bestIdx = nextIdx;
-  for (int i = nextIdx + 1; i < count; ++i) {
-    if (scores[i] > scores[bestIdx]) {
-      bestIdx = i;
-    }
-  }
-
-  // Swap and return
-  std::swap(list[nextIdx], list[bestIdx]);
-  std::swap(scores[nextIdx], scores[bestIdx]);
-    return list[nextIdx++];
-}
 
 // Piece values for SEE (in centipawns)
 static constexpr int SEE_PIECE_VALUES[7] = {
@@ -310,37 +29,39 @@ static constexpr int SEE_PIECE_VALUES[7] = {
 };
 
 namespace {
-    uint64_t pieceSquareHash[12][64];
-    bool hashesInitialized = false;
-    void initPieceSquareHashes() {
-        if (hashesInitialized) return;
-        uint64_t seed = 0x9E3779B97F4A7C15ULL;
-        for (int i=0; i<12; i++) {
-            for (int sq=0; sq<64; sq++) {
-                seed ^= seed >> 12;
-                seed ^= seed << 25;
-                seed ^= seed >> 27;
-                pieceSquareHash[i][sq] = seed * 2685821657736338717ULL;
-            }
-        }
-        hashesInitialized = true;
+uint64_t pieceSquareHash[12][64];
+bool hashesInitialized = false;
+void initPieceSquareHashes() {
+  if (hashesInitialized)
+    return;
+  uint64_t seed = 0x9E3779B97F4A7C15ULL;
+  for (int i = 0; i < 12; i++) {
+    for (int sq = 0; sq < 64; sq++) {
+      seed ^= seed >> 12;
+      seed ^= seed << 25;
+      seed ^= seed >> 27;
+      pieceSquareHash[i][sq] = seed * 2685821657736338717ULL;
     }
-
-    double LMRTable[SearchConstants::MAX_PLY + 1][256];
-    bool lmrInitialized = false;
-    void initLMR() {
-        if (lmrInitialized) return;
-        for (int i = 0; i <= SearchConstants::MAX_PLY; i++) {
-            for (int n = 0; n < 256; n++) {
-                if (i > 0 && n > 0)
-                    LMRTable[i][n] = 4.0 / 10.0 + std::log(i) * std::log(n) / (20.0 / 10.0);
-                else
-                    LMRTable[i][n] = 0;
-            }
-        }
-        lmrInitialized = true;
-    }
+  }
+  hashesInitialized = true;
 }
+
+double LMRTable[SearchConstants::MAX_PLY + 1][256];
+bool lmrInitialized = false;
+void initLMR() {
+  if (lmrInitialized)
+    return;
+  for (int i = 0; i <= SearchConstants::MAX_PLY; i++) {
+    for (int n = 0; n < 256; n++) {
+      if (i > 0 && n > 0)
+        LMRTable[i][n] = 4.0 / 10.0 + std::log(i) * std::log(n) / (20.0 / 10.0);
+      else
+        LMRTable[i][n] = 0;
+    }
+  }
+  lmrInitialized = true;
+}
+} // namespace
 
 // Helper: check if a square is near the enemy king (within 2 squares)
 static bool isNearKing(Square sq, Square kingSquare) {
@@ -348,7 +69,7 @@ static bool isNearKing(Square sq, Square kingSquare) {
                           static_cast<int>(kingSquare.file()));
   int rankDiff = std::abs(static_cast<int>(sq.rank()) -
                           static_cast<int>(kingSquare.rank()));
-    return fileDiff <= 2 && rankDiff <= 2;
+  return fileDiff <= 2 && rankDiff <= 2;
 }
 
 // Helper: Normalize mate/TB scores for transposition table storage
@@ -363,7 +84,7 @@ static int value_to_tt(int value, int ply) {
     return value + ply;
   if (value <= -SearchConstants::TB_WIN_IN_MAX)
     return value - ply;
-    return value;
+  return value;
 }
 
 // Helper: Denormalize mate/TB scores when retrieving from transposition table
@@ -378,7 +99,7 @@ static int value_from_tt(int value, int ply) {
     return value - ply;
   if (value <= -SearchConstants::TB_WIN_IN_MAX)
     return value + ply;
-    return value;
+  return value;
 }
 
 Negamax::Negamax(IEvaluator &eval, TranspositionTable &table,
@@ -387,7 +108,7 @@ Negamax::Negamax(IEvaluator &eval, TranspositionTable &table,
     : evalCtx_(eval), tt_(table), shared_(shared), isMainThread_(isMainThread),
       threadId_(threadId) {
   h_ = std::make_unique<SearchHeuristics>();
-  
+
   initPieceSquareHashes();
   initLMR();
   clearState();
@@ -398,19 +119,19 @@ void Negamax::clearState() {
     row[0] = Move(0);
     row[1] = Move(0);
   }
-  
+
   h_->failHighCount_.fill(0);
-  
+
   // History and Continuation History persist across moves for better warm-up
-  // They use internal exponential gravity (entry += bonus - entry * abs(bonus) / 16384)
-  // which naturally manages decay/stale data.
+  // They use internal exponential gravity (entry += bonus - entry * abs(bonus)
+  // / 16384) which naturally manages decay/stale data.
 
   // Clear killers and fail-high counts only
   // We don't clear history_ or contHist_ or captureHist_ here.
-  
+
   prevMove_.fill(Move(0)); // Clear previous move tracking
   prevPiece_.fill(Piece::NONE);
-  
+
   // No longer clearing contHist_ or captureHist_ for persistence
 
   for (auto &row : h_->pvTable_) {
@@ -420,22 +141,25 @@ void Negamax::clearState() {
 
   // Decay correction history instead of clearing
   // Gravity-based decay: halve all entries to fade stale corrections
-  for (auto& side : h_->pawnCorrHist_) {
-    for (auto& v : side) v /= 2;
+  for (auto &side : h_->pawnCorrHist_) {
+    for (auto &v : side)
+      v /= 2;
   }
-  for (auto& side : h_->nonPawnCorrHist_) {
-    for (auto& color : side) {
-      for (auto& v : color) v /= 2;
+  for (auto &side : h_->nonPawnCorrHist_) {
+    for (auto &color : side) {
+      for (auto &v : color)
+        v /= 2;
     }
   }
-  for (auto& d1 : h_->contCorrHist_) {
-    for (auto& d2 : d1) {
-      for (auto& d3 : d2) {
-        for (auto& v : d3) v /= 2;
+  for (auto &d1 : h_->contCorrHist_) {
+    for (auto &d2 : d1) {
+      for (auto &d3 : d2) {
+        for (auto &v : d3)
+          v /= 2;
       }
     }
   }
-  
+
   evalHistory_.fill(SearchConstants::INVALID_EVAL);
 
   // Reset time management state
@@ -445,17 +169,54 @@ void Negamax::clearState() {
   scoreDrops_ = 0;
   rootNodeCounts_.fill(0);
   searchNodes_ = 0;
+  localNodes_ = 0;
+  localTbHits_ = 0;
+  localTtHits_ = 0;
+  localSelDepth_ = 0;
+}
+
+void Negamax::flushLocalSearchStats() {
+  if (!shared_)
+    return;
+
+  if (localNodes_ > 0) {
+    shared_->totalNodes.fetch_add(localNodes_, std::memory_order_relaxed);
+    localNodes_ = 0;
+  }
+
+  if (localTbHits_ > 0) {
+    shared_->tbHits.fetch_add(localTbHits_, std::memory_order_relaxed);
+    localTbHits_ = 0;
+  }
+
+  if (localTtHits_ > 0) {
+    shared_->ttHits.fetch_add(localTtHits_, std::memory_order_relaxed);
+    localTtHits_ = 0;
+  }
+
+  int observedSelDepth = shared_->selDepth.load(std::memory_order_relaxed);
+  while (localSelDepth_ > observedSelDepth &&
+         !shared_->selDepth.compare_exchange_weak(
+             observedSelDepth, localSelDepth_, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
 }
 
 Move Negamax::startSearch(Board &root, const SearchParams &params) {
   rootNodeCounts_.fill(0);
   searchNodes_ = 0;
-  
+
   // Only Main Thread handles initialization of shared state and time
   if (isMainThread_) {
-    shared_->stop = false;
     shared_->totalNodes = 0;
-    shared_->startTime = std::chrono::steady_clock::now();
+    shared_->selDepth.store(0, std::memory_order_relaxed);
+    shared_->tbHits.store(0, std::memory_order_relaxed);
+    shared_->ttHits.store(0, std::memory_order_relaxed);
+    const int64_t startTimeNs =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+    shared_->startTimeNs.store(startTimeNs, std::memory_order_relaxed);
     localNodes_ = 0; // Reset local counter
 
     // Store searchMoves for root filtering
@@ -477,31 +238,31 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
               << "ms optimal=" << timeAlloc_.optimalTime << "ms"
               << " phase=" << phase << std::endl;
 
-
     // Start new search (age TT entries)
     // IMPORTANT: Always increment age, even for ponder searches!
     tt_.newSearch();
 
     // CHEKMATE/STALEMATE CHECK AT ROOT
     // If the root position has no legal moves, we must return immediately.
-    // Otherwise the search loop will run with 0 moves, returning -INFINITE score,
-    // which results in "mate --49999".
+    // Otherwise the search loop will run with 0 moves, returning -INFINITE
+    // score, which results in "mate --49999".
     Movelist rootMoves;
     MoveGen::generateLegalMoves(rootMoves, root);
-    
+
     if (rootMoves.empty()) {
-        int score = root.inCheck() ? -SearchConstants::MATE_SCORE : SearchConstants::DRAW_SCORE;
-        
-        // Report result
-        if (infoCallback_) {
-            // Send depth 0 info with precise score
-            infoCallback_(0, score, 0, 0, {});
-        }
-        
-        // Ensure we stop
-        shared_->stop = true;
-        
-    return Move(0);
+      int score = root.inCheck() ? -SearchConstants::MATE_SCORE
+                                 : SearchConstants::DRAW_SCORE;
+
+      // Report result
+      if (infoCallback_) {
+        // Send depth 0 info with precise score
+        infoCallback_(0, score, 0, 0, {});
+      }
+
+      // Ensure we stop
+      shared_->stop = true;
+
+      return Move(0);
     }
   }
 
@@ -513,185 +274,10 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
   // --- Tablebase Probe (Main Thread Only, Skip During Ponder) ---
   // Don't probe TB during ponder - we can't use opponent's TB move anyway,
   // and the output can leak into the next search causing wrong moves.
-  if (isMainThread_ && !params.ponder && Tablebase::available(root)) {
-    auto tbResult = Tablebase::probeRoot(root);
-    if (tbResult) {
-      Move tbMove = std::get<0>(*tbResult);
-      Tablebase::WDL wdl = std::get<1>(*tbResult);
-      int dtz = std::get<2>(*tbResult);
-
-      // PROMOTION FIX: DTZ doesn't distinguish mate speed.
-      // For promotion moves, check all 4 promotion types, keep winning ones,
-      // then use NN eval to pick the best (fastest mate).
-      if (wdl == Tablebase::WDL::WIN && tbMove.typeOf() == Move::PROMOTION) {
-        std::vector<std::pair<Move, int>> winningPromos; // (move, eval)
-
-        const PieceType promoTypes[] = {PieceType::QUEEN, PieceType::ROOK,
-                                        PieceType::BISHOP, PieceType::KNIGHT};
-
-        for (PieceType pt : promoTypes) {
-          Move promo =
-              Move::make<Move::PROMOTION>(tbMove.from(), tbMove.to(), pt);
-
-          // Check if this promotion is winning in TB
-          Board testBoard = root;
-          testBoard.makeMove(promo);
-          auto promoWdl = Tablebase::probeWDL(testBoard);
-
-          // If winning (opponent's view = LOSS), add to candidates
-          if (promoWdl && *promoWdl == Tablebase::WDL::LOSS) {
-            // Evaluate with NN to find best
-            int eval = evalCtx_.evaluate(testBoard);
-            // Negate since it's opponent's turn after our move
-            winningPromos.push_back({promo, -eval});
-          }
-        }
-
-        // Pick promotion with best eval (highest = fastest mate typically)
-        if (!winningPromos.empty()) {
-          auto best = std::max_element(
-              winningPromos.begin(), winningPromos.end(),
-              [](const auto &a, const auto &b) { return a.second < b.second; });
-
-          if (best->first != tbMove) {
-            std::cout << "info string TB: eval picked "
-                      << chess::uci::moveToUci(best->first) << " (eval "
-                      << best->second << ") over TB suggestion" << std::endl;
-          }
-          tbMove = best->first;
-        }
-      }
-
-      // Found TB move - check for repetition
-      bool cxRepetition = false;
-      {
-        Board testBoard = root;
-        testBoard.makeMove(tbMove);
-        // Strict 2-fold repetition check for safety in winning lines
-        if (testBoard.isRepetition(1)) {
-          cxRepetition = true;
-        }
-      }
-
-      bool acceptTbMove = true;
-      if (cxRepetition) {
-        if (wdl == Tablebase::WDL::WIN || wdl == Tablebase::WDL::CURSED_WIN) {
-          std::cout << "info string TB: Root move "
-                    << chess::uci::moveToUci(tbMove)
-                    << " leads to repetition. Rejecting to preserve WIN."
-                    << std::endl;
-          acceptTbMove = false;
-        }
-      }
-
-      if (acceptTbMove) {
-        std::cout << "info string TB: hit at root, WDL="
-                  << static_cast<int>(wdl) << " DTZ=" << dtz << std::endl;
-
-        if (infoCallback_) {
-          std::vector<Move> pv = {tbMove};
-          // Use WDL + DTZ for score
-          int tbScore;
-          if (wdl == Tablebase::WDL::WIN) {
-            tbScore = TB_WIN_SCORE - (dtz * 2);
-          } else if (wdl == Tablebase::WDL::LOSS) {
-            tbScore = -TB_WIN_SCORE + (dtz * 2);
-          } else if (wdl == Tablebase::WDL::CURSED_WIN) {
-            tbScore = 100;
-          } else if (wdl == Tablebase::WDL::BLESSED_LOSS) {
-            tbScore = -100;
-          } else {
-            tbScore = DRAW_SCORE;
-          }
-          infoCallback_(0, tbScore, 0, 0, pv);
-        }
-
-        // Stop other threads immediately
-        shared_->stop = true;
-    return tbMove;
-      }
-    }
-
-    // Fallback: If probeRoot failed OR we rejected the move due to repetition
-    {
-      // probeRoot failed - try WDL-only fallback
-      // This happens when DTZ files are missing/corrupt but WDL files work, or
-      // move rejected.
-      auto wdl = Tablebase::probeWDL(root);
-      if (wdl &&
-          (*wdl == Tablebase::WDL::WIN || *wdl == Tablebase::WDL::LOSS)) {
-        std::cout << "info string TB: probeRoot failed, using WDL fallback"
-                  << std::endl;
-        std::cout << "info string DEBUG: TB Fallback searching from FEN: "
-                  << root.getFen() << std::endl;
-
-        // Test each legal move and find one that maintains winning/losing
-        // status
-        Movelist moves;
-        MoveGen::generateLegalMoves(moves, root);
-
-        Move bestTbMove;
-        int bestEval = -INFINITE;
-
-        for (const Move &move : moves) {
-          Board testBoard = root;
-          testBoard.makeMove(move);
-
-          auto childWdl = Tablebase::probeWDL(testBoard);
-          if (!childWdl)
-            continue;
-
-          // If we're winning, pick move where opponent is losing
-          // If we're losing, this fallback won't help much but pick least bad
-          bool isGoodMove = false;
-          if (*wdl == Tablebase::WDL::WIN &&
-              *childWdl == Tablebase::WDL::LOSS) {
-            // STRICT SAFETY: Check repetition for candidate moves too!
-            if (testBoard.isRepetition(1)) {
-              continue; // Skip this move, it repeats!
-            }
-            isGoodMove = true;
-          } else if (*wdl == Tablebase::WDL::LOSS &&
-                     *childWdl == Tablebase::WDL::WIN) {
-            isGoodMove = true; // We're losing, opponent winning - expected
-          }
-
-          if (isGoodMove) {
-            // Use NN eval to break ties (prefer faster wins)
-            int eval = -evalCtx_.evaluate(testBoard);
-            if (eval > bestEval) {
-              bestEval = eval;
-              bestTbMove = move;
-            }
-          }
-        }
-
-        if (bestTbMove != Move(0)) {
-          // SAFETY CHECK: Verify move is legal before returning
-          Piece piece = root.at(bestTbMove.from());
-          if (piece == Piece::NONE || piece.color() != root.sideToMove()) {
-            std::cout
-                << "info string CRITICAL: TB Fallback selected illegal move "
-                << chess::uci::moveToUci(bestTbMove)
-                << " (Piece: " << (int)piece.type()
-                << ", Color: " << (int)piece.color() << ")"
-                << ". Falling back to search." << std::endl;
-            // Do not return; fall through to normal search
-          } else {
-            std::cout << "info string TB: WDL fallback found "
-                      << chess::uci::moveToUci(bestTbMove) << std::endl;
-
-            int tbScore = Tablebase::wdlToScore(*wdl, 0);
-            if (infoCallback_) {
-              std::vector<Move> pv = {bestTbMove};
-              infoCallback_(0, tbScore, 0, 0, pv);
-            }
-
-            shared_->stop = true;
-    return bestTbMove;
-          }
-        }
-      }
+  if (isMainThread_ && !params.ponder) {
+    auto tbMoveOpt = TablebaseFallback::probeRoot(root, evalCtx_, shared_, infoCallback_);
+    if (tbMoveOpt.has_value()) {
+      return *tbMoveOpt;
     }
   }
 
@@ -701,7 +287,7 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
 
   // Aspiration window parameters
   constexpr int ASPIRATION_WINDOW = 25;
-  constexpr int HELPER_ASPIRATION_WINDOW = 50;  // Wider for helpers
+  constexpr int HELPER_ASPIRATION_WINDOW = 50; // Wider for helpers
   int alpha = -INFINITE;
   int beta = INFINITE;
 
@@ -715,7 +301,8 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
     shared_->mainThreadScore.store(0, std::memory_order_relaxed);
   }
 
-  // SMP Strategy: Helpers search same depths as main but with aspiration guidance
+  // SMP Strategy: Helpers search same depths as main but with aspiration
+  // guidance
   // - Main thread: Full iterative deepening with aspiration windows
   // - Helper threads: Full depths but use main thread's score for windows
   //   This allows helpers to contribute meaningful TT entries at all depths
@@ -730,15 +317,15 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
   uint64_t startHash = root.hash();
   chess::Color startStm = root.sideToMove();
 
-  for (int depth = 1;
-       depth <= (isMainThread_ ? maxDepth : helperMaxDepth); ++depth) {
-    
+  for (int depth = 1; depth <= (isMainThread_ ? maxDepth : helperMaxDepth);
+       ++depth) {
+
     // VERIFICATION: Check board state at start of iteration
     if (root.hash() != startHash || root.sideToMove() != startStm) {
-      std::cout << "info string CRITICAL: Board state corrupted after depth " << (depth - 1) 
-                << "! StartHash: " << std::hex << startHash << " Now: " << root.hash() 
-                << " StartStm: " << (int)startStm << " Now: " << (int)root.sideToMove() 
-                << std::dec << std::endl;
+      std::cout << "info string CRITICAL: Board state corrupted after depth "
+                << (depth - 1) << "! StartHash: " << std::hex << startHash
+                << " Now: " << root.hash() << " StartStm: " << (int)startStm
+                << " Now: " << (int)root.sideToMove() << std::dec << std::endl;
       // Force recovery if possible, but search is likely compromised
     }
     currentIter_ = depth; // Ensure Singular Extensions activate correctly
@@ -754,12 +341,12 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
     if (!isMainThread_) {
       int mainDepth = shared_->mainThreadDepth.load(std::memory_order_relaxed);
       int targetDepth = shared_->targetDepth.load(std::memory_order_relaxed);
-      
+
       // Stop if main thread has completed target depth
       if (mainDepth >= targetDepth && targetDepth > 0) {
         break;
       }
-      
+
       // Also check stop flag
       if (shared_->stop.load(std::memory_order_relaxed)) {
         break;
@@ -777,9 +364,10 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
       // Helper thread: use main thread's score with wider window
       int mainScore = shared_->mainThreadScore.load(std::memory_order_relaxed);
       int mainDepth = shared_->mainThreadDepth.load(std::memory_order_relaxed);
-      
+
       // Use main thread's score if it's recent enough (within 2 depths)
-      if (mainDepth >= depth - 2 && mainDepth > 0 && std::abs(mainScore) < MATE_IN_MAX) {
+      if (mainDepth >= depth - 2 && mainDepth > 0 &&
+          std::abs(mainScore) < MATE_IN_MAX) {
         // Use wider aspiration window for helpers (50cp instead of 25cp)
         // This allows some exploration while still benefiting from bounds
         int windowSize = HELPER_ASPIRATION_WINDOW + (depth - mainDepth) * 20;
@@ -854,7 +442,7 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
       lastScore_ = score;
       bestMove = newBestMove;
       bestScore = score;
-      
+
       // =========================================================================
       // LAZY SMP: Main thread publishes score and depth for helper threads
       // =========================================================================
@@ -866,11 +454,8 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
 
     // Only Main Thread reports info and checks soft time limits
     if (isMainThread_) {
-      // Flush local node counter before reporting (for accurate display)
-      if (localNodes_ > 0) {
-        shared_->totalNodes.fetch_add(localNodes_, std::memory_order_relaxed);
-        localNodes_ = 0;
-      }
+      // Flush local counters before reporting (for accurate display)
+      flushLocalSearchStats();
 
       reachedDepth = depth;
 
@@ -919,8 +504,11 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
           pvStr += " ";
         pvStr += chess::uci::moveToUci(h_->pvTable_[0][j]);
       }
-      std::cout << "info multipv 1 score cp " << (std::abs(bestScore) >= SearchConstants::MATE_IN_MAX ? bestScore : bestScore * 100 / 195) << " pv " << pvStr
-                << std::endl;
+      std::cout << "info multipv 1 score cp "
+                << (std::abs(bestScore) >= SearchConstants::MATE_IN_MAX
+                        ? bestScore
+                        : bestScore * 100 / 195)
+                << " pv " << pvStr << std::endl;
     }
 
     // Search for additional PVs by excluding already-found moves
@@ -996,7 +584,10 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
             pvStr += " ";
           pvStr += chess::uci::moveToUci(h_->pvTable_[0][j]);
         }
-        std::cout << "info multipv " << pvNum << " score cp " << (std::abs(subScore) >= SearchConstants::MATE_IN_MAX ? subScore : subScore * 100 / 195)
+        std::cout << "info multipv " << pvNum << " score cp "
+                  << (std::abs(subScore) >= SearchConstants::MATE_IN_MAX
+                          ? subScore
+                          : subScore * 100 / 195)
                   << " pv " << pvStr << std::endl;
 
         excludedMoves.push_back(subBestMove);
@@ -1009,27 +600,26 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
     searchMoves_.clear();
   }
 
+  flushLocalSearchStats();
+
+  // Capture whether search was already stopped/interrupted before we force
+  // global stop for cleanup below.
+  const bool stopWasRequested =
+      shared_ && shared_->stop.load(std::memory_order_relaxed);
+
   if (isMainThread_) {
     // Ensure everyone stops
     shared_->stop = true;
 
-    // Debug logging
-    if (tt_.isDebugMode()) {
-      std::cout << "info string DEBUG: Search finished. Depth: " << reachedDepth
-                << " Score: " << bestScore
-                << " Move: " << chess::uci::moveToUci(bestMove)
-                << " TT Util: " << tt_.hashfull() << "/1000" << std::endl;
 
-      // Dump TT if requested via global flag (could be added to SearchParams)
-      // or just log that we finished.
-    }
   }
   // Safety Fallback: Ensure we never return an illegal/null move
   if (isMainThread_ &&
       (bestMove == Move(Move::NO_MOVE) || bestMove == Move(Move::NULL_MOVE))) {
-    std::cout
-        << "info string CRITICAL: Search returned no move. Attempting fallback."
-        << std::endl;
+    std::cout << "info string WARNING: Search ended without finalized move "
+              << "(depth=" << reachedDepth
+              << ", stop=" << (stopWasRequested ? 1 : 0)
+              << "). Attempting fallback." << std::endl;
 
     // 1. Try TT
     bestMove = tt_.probeMove(root.hash());
@@ -1062,7 +652,7 @@ Move Negamax::startSearch(Board &root, const SearchParams &params) {
     }
   }
 
-    return bestMove;
+  return bestMove;
 }
 
 // Helper for Lazy Eval Pruning - The "Security Guard"
@@ -1096,7 +686,7 @@ bool Negamax::canLazySkip(const Board &board, int depth, int alpha, int beta,
   if (ply > 0) {
     Move lastMove = prevMove_[ply - 1];
     if (lastMove != Move(0) && lastMove.typeOf() == Move::PROMOTION) {
-    return false;
+      return false;
     }
   }
 
@@ -1147,36 +737,73 @@ bool Negamax::canLazySkip(const Board &board, int depth, int alpha, int beta,
     return true;
   }
 
-    return false;
+  return false;
 }
 
-uint64_t Negamax::getPawnKey(const Board& board) const {
-    uint64_t key = 0;
-    chess::Bitboard pawns = board.pieces(chess::PieceType::PAWN);
-    while (pawns) {
-        chess::Square sq = pawns.pop();
-        key ^= pieceSquareHash[static_cast<int>(board.at(sq).internal())][sq.index()];
-    }
-    return key;
+uint64_t Negamax::getPawnKey(const Board &board) const {
+  uint64_t key = 0;
+  chess::Bitboard pawns = board.pieces(chess::PieceType::PAWN);
+  while (pawns) {
+    chess::Square sq = pawns.pop();
+    key ^=
+        pieceSquareHash[static_cast<int>(board.at(sq).internal())][sq.index()];
+  }
+  return key;
 }
 
-uint64_t Negamax::getNonPawnKey(const Board& board, chess::Color c) const {
-    uint64_t key = 0;
-    chess::Bitboard np = board.us(c) & ~(board.pieces(chess::PieceType::PAWN) | board.pieces(chess::PieceType::KING));
-    while (np) {
-        chess::Square sq = np.pop();
-        key ^= pieceSquareHash[static_cast<int>(board.at(sq).internal())][sq.index()];
-    }
-    return key;
+uint64_t Negamax::getNonPawnKey(const Board &board, chess::Color c) const {
+  uint64_t key = 0;
+  chess::Bitboard np = board.us(c) & ~(board.pieces(chess::PieceType::PAWN) |
+                                       board.pieces(chess::PieceType::KING));
+  while (np) {
+    chess::Square sq = np.pop();
+    key ^=
+        pieceSquareHash[static_cast<int>(board.at(sq).internal())][sq.index()];
+  }
+  return key;
+}
+
+int Negamax::applyCorrHist(int rawEval, const Board &board, int ply) const {
+  int eval = rawEval * (200 - static_cast<int>(board.halfMoveClock())) / 200;
+  if (!shared_->config.enableCorrHist)
+    return eval;
+
+  int pc = static_cast<int>(board.sideToMove());
+  uint64_t pKey = getPawnKey(board) % 16384;
+  uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
+  uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
+
+  int correction = h_->pawnCorrHist_[pc][pKey] +
+                   h_->nonPawnCorrHist_[pc][0][npKeyW] +
+                   h_->nonPawnCorrHist_[pc][1][npKeyB];
+
+  if (ply >= 2 && prevMove_[ply - 1] != Move(0) &&
+      prevMove_[ply - 2] != Move(0) && prevPiece_[ply - 1] != Piece::NONE &&
+      prevPiece_[ply - 2] != Piece::NONE) {
+    int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
+    int pTo2 = prevMove_[ply - 2].to().index();
+    int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
+    int pTo1 = prevMove_[ply - 1].to().index();
+    correction += h_->contCorrHist_[pPiece2][pTo2][pPiece1][pTo1];
+  }
+
+  return std::clamp(eval + shared_->config.corrWeight * correction / 512,
+                    -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY,
+                    SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY);
 }
 
 int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
-                       bool allowNull, int extensions, bool prevWasCapture, bool cutnode, Move excludedMove) {
+                       bool allowNull, int extensions, bool prevWasCapture,
+                       bool cutnode, Move excludedMove) {
+  if (ply > localSelDepth_) {
+    localSelDepth_ = ply;
+  }
+
   int alphaOriginal = alpha;
   int betaOriginal = beta;
   // Safety check: prevent stack overflow from excessive recursion
   if (ply >= MAX_PLY - 1) {
-    return evalCtx_.evaluate(board);
+    return evalCtx_.evaluate(board, ply);
   }
 
   // Check for stop
@@ -1190,7 +817,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   // Check for draw
   if (ply > 0) {
     if (isDraw(board)) {
-    return DRAW_SCORE - CONTEMPT_FACTOR;
+      return DRAW_SCORE;
     }
   }
 
@@ -1201,12 +828,11 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
 
   // Thread-local node counting with periodic flush for accurate time management
   localNodes_++;
-  
+
   // === OPTIMIZATION: More frequent node sync (every 4096 nodes) ===
   // This ensures time checks use fresh node counts during long iterations
   if ((localNodes_ & 4095) == 0) {
-    shared_->totalNodes.fetch_add(localNodes_, std::memory_order_relaxed);
-    localNodes_ = 0;
+    flushLocalSearchStats();
   }
 
   bool inCheck = board.inCheck();
@@ -1223,10 +849,13 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   // fast for 3/4/5 pieces and we want to stop search immediately.
   // State for Tablebase result
 
-  if (ply > 0 && Tablebase::available(board)) {
+  if (ply > 0 && Tablebase::available(board) &&
+      !(shared_ &&
+        shared_->disableTablebase.load(std::memory_order_relaxed))) {
     // Lazy Probing: Check WDL first (fast)
     auto wdl = Tablebase::probeWDL(board);
     if (wdl) {
+      ++localTbHits_;
       int lazyScore = Tablebase::wdlToScore(*wdl, ply);
 
       // 1. Fail High / Beta Cutoff (Winning or Draw refutation)
@@ -1238,16 +867,16 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
         // accurate DTZ-based score modification for the "fastest win".
         // However, for a cutoff, the raw wdl score is sufficient.
         tt_.store(posKey, depth, value_to_tt(lazyScore, ply), Bound::LOWER,
-                  Move(0), lazyScore);
-    return lazyScore;
+                  Move(0), SearchConstants::INVALID_EVAL);
+        return lazyScore;
       }
 
       // 2. Fail Low / Alpha Cutoff
       // If the TB result is worse than alpha, we can't improve.
       if (lazyScore <= alpha) {
         tt_.store(posKey, depth, value_to_tt(lazyScore, ply), Bound::UPPER,
-                  Move(0), lazyScore);
-    return lazyScore;
+                  Move(0), SearchConstants::INVALID_EVAL);
+        return lazyScore;
       }
 
       // 3. PV Node or Window Search needing exact move
@@ -1271,11 +900,11 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
 
         // Store Exact result
         tt_.store(posKey, depth, value_to_tt(exactScore, ply), Bound::EXACT,
-                  localTbMove, exactScore);
-    return exactScore;
+                  localTbMove, SearchConstants::INVALID_EVAL);
+        return exactScore;
       } else {
         // Fallback (should rarely happen if WDL worked)
-    return lazyScore;
+        return lazyScore;
       }
     }
   }
@@ -1286,29 +915,39 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   int ttDepth = -1;
   Bound foundBound = Bound::NONE;
   // posKey already defined above
-  
-  // Bug #2 Fix: If singularSearch is true, force ttHit = false
-  // This avoids re-searching the ttMove/excludedMove through the TT lookup
+
+  // Force ttHit to false during singular extension search to ensure proper verification
   bool ttHit = false;
   if (!singularSearch) {
-    ttHit = tt_.probe(posKey, depth, alpha, beta, ttScore, ttMove, ttDepth,
-                       foundBound);
+    ttHit = tt_.probe(posKey, depth, ttScore, ttMove, ttDepth, foundBound);
+    if (ttHit) {
+      ++localTtHits_;
+    }
+  }
+
+  if (foundBound != Bound::NONE) {
+    ttScore = value_from_tt(ttScore, ply);
   }
 
   if (ttHit && !pvNode) {
-    // PV FIX: Even on TT cutoff, we should at least provide the TT move as a 1-move PV
-    // This prevents the parent from seeing stale/garbage PV data from other branches.
-    if (ttMove != Move(0)) {
-      h_->pvTable_[ply][ply] = ttMove;
-      pvLength_[ply] = ply + 1;
+    if (foundBound == Bound::EXACT ||
+        (foundBound == Bound::UPPER && ttScore <= alpha) ||
+        (foundBound == Bound::LOWER && ttScore >= beta)) {
+      // Ensure the TT move is provided as a PV move even on TT cutoff
+      // to prevent the parent from seeing stale/garbage PV data from other branches.
+      if (ttMove != Move(0)) {
+        h_->pvTable_[ply][ply] = ttMove;
+        pvLength_[ply] = ply + 1;
+      }
+      return ttScore;
     }
-    return value_from_tt(ttScore, ply);
   }
 
   // Internal Iterative Reduction
   // Apply when PV or cutnode has no TT move at sufficient depth
   // Only when NOT in check - never reduce depth during evasions
-  if ((pvNode || cutnode) && ttMove == Move(0) && depth > 2 && !singularSearch && !inCheck) {
+  if ((pvNode || cutnode) && ttMove == Move(0) && depth > 2 &&
+      !singularSearch && !inCheck) {
     depth--;
   }
 
@@ -1327,72 +966,34 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
     // Even if it's from a shallower search, a search score is a better proxy
     // than a raw static eval (depth 0).
     if (foundBound == Bound::EXACT) {
-      eval = value_from_tt(ttScore, ply);
-      rawEval = eval;  // Approximate - TT score is already refined
+      eval = ttScore;
+      rawEval = eval; // Approximate - TT score is already refined
       canSkipEval = true;
     }
     // 2. TT has cached raw eval - apply current corrhist correction
     else {
       rawEval = cachedScore;
-      // Re-apply current corrections to the raw eval
-      int pc = static_cast<int>(board.sideToMove());
-      uint64_t pKey = getPawnKey(board) % 16384;
-      uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
-      uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
-      int correction = h_->pawnCorrHist_[pc][pKey] + 
-                       h_->nonPawnCorrHist_[pc][0][npKeyW] + 
-                       h_->nonPawnCorrHist_[pc][1][npKeyB];
-
-      if (ply >= 2 && prevMove_[ply - 1] != Move(0) && prevMove_[ply - 2] != Move(0)
-          && prevPiece_[ply - 1] != Piece::NONE && prevPiece_[ply - 2] != Piece::NONE) {
-          int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
-          int pTo2 = prevMove_[ply - 2].to().index();
-          int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
-          correction += h_->contCorrHist_[pPiece2][pTo2][pPiece1][pTo2];
-      }
-
-      eval = rawEval * (200 - board.halfMoveClock()) / 200;
-      if (shared_->config.enableCorrHist) {
-        eval = std::clamp(eval + shared_->config.corrWeight * correction / 512, -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY, SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY);
-      }
+      eval = applyCorrHist(rawEval, board, ply);
       canSkipEval = true;
     }
   }
 
   // --- NN Evaluation (no lazy skip) ---
   if (!canSkipEval) {
-    rawEval = evalCtx_.evaluate(board);
-    
-    // --- Eval Correction ---
-    int pc = static_cast<int>(board.sideToMove());
-    uint64_t pKey = getPawnKey(board) % 16384;
-    uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
-    uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
+    rawEval = evalCtx_.evaluate(board, ply);
 
-    int correction = h_->pawnCorrHist_[pc][pKey] + 
-                     h_->nonPawnCorrHist_[pc][0][npKeyW] + 
-                     h_->nonPawnCorrHist_[pc][1][npKeyB];
-
-    if (ply >= 2 && prevMove_[ply - 1] != Move(0) && prevMove_[ply - 2] != Move(0)
-        && prevPiece_[ply - 1] != Piece::NONE && prevPiece_[ply - 2] != Piece::NONE) {
-        int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
-        int pTo2 = prevMove_[ply - 2].to().index();
-        int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
-        correction += h_->contCorrHist_[pPiece2][pTo2][pPiece1][pTo2];
-    }
-                     
-    eval = rawEval * (200 - board.halfMoveClock()) / 200;
-    if (shared_->config.enableCorrHist) {
-      eval = std::clamp(eval + shared_->config.corrWeight * correction / 512, -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY, SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY);
-    }
+    // Apply correction history to raw eval
+    eval = applyCorrHist(rawEval, board, ply);
 
     evalComputed = true; // Mark as fresh NN eval
     // Store RAW eval in TT (not corrected!) so future visits can re-correct
     tt_.storeEval(posKey, static_cast<int16_t>(rawEval));
   }
-  
+
   // Record eval history for improving heuristic
-  evalHistory_[ply] = evalComputed ? eval : (canSkipEval ? eval : SearchConstants::INVALID_EVAL);
+  evalHistory_[ply] =
+      evalComputed ? eval
+                   : (canSkipEval ? eval : SearchConstants::INVALID_EVAL);
 
   // --------------------------------------------------------------
 
@@ -1401,12 +1002,13 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
       eval + 400 * depth < alpha) {
     int razorScore = quiescence(board, alpha, beta, ply);
     if (razorScore <= alpha) {
-        return razorScore;
+      return razorScore;
     }
   }
 
   // Reverse Futility Pruning
-  // Compute improving: is our eval better than 2 plies ago (or 4 if 2 unavailable)?
+  // Compute improving: is our eval better than 2 plies ago (or 4 if 2
+  // unavailable)?
   bool improving = false;
   if (!inCheck && ply >= 2) {
     int pastEval = evalHistory_[ply - 2];
@@ -1419,15 +1021,16 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   }
 
   if (!pvNode && !inCheck && !singularSearch && depth <= 8 &&
-      eval - shared_->config.reverseFutilityMargin * (depth - improving) >= beta &&
+      eval - shared_->config.reverseFutilityMargin * (depth - improving) >=
+          beta &&
       std::abs(beta) < MATE_IN_MAX &&
       std::abs(eval) < MATE_IN_MAX) { // Tightened guard
     return (eval + beta) / 2;
   }
 
   // Null Move Pruning
-  if (!singularSearch && allowNull && !inCheck && !pvNode && depth >= 3 && eval >= beta &&
-      board.hasNonPawnMaterial(board.sideToMove())) {
+  if (!singularSearch && allowNull && !inCheck && !pvNode && depth >= 3 &&
+      eval >= beta && board.hasNonPawnMaterial(board.sideToMove())) {
     board.makeNullMove();
     prevMove_[ply] = Move(0);
     prevPiece_[ply] = Piece::NONE;
@@ -1450,39 +1053,42 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   }
 
   // ProbCut
-  // If we are doing well, and a capture beats a high beta margin on a shallow search,
-  // we can safely assume the full search will also fail high and prune the node.
-  if (!singularSearch && !inCheck && depth >= 5 && std::abs(beta) < MATE_IN_MAX - MAX_PLY) {
-      int pBeta = beta + 250; // ProbCut Margin
-      bool doProbCut = true;
-      
-      // If TT move indicates low score, we skip ProbCut
-      if (ttHit && ttMove != Move(0) && ttDepth >= depth - 3 && ttScore < pBeta) {
-          doProbCut = false;
-      }
-      
-      if (doProbCut) {
-          Movelist probcutMoves;
-          MoveGen::generateCaptures(probcutMoves, board);
-          int threshold = pBeta - eval;
-          
-          for (const Move& move : probcutMoves) {
-              if (see(board, move) >= threshold) {
-                  board.makeMove(move);
-                  
-                  int pcScore = -quiescence(board, -pBeta, -pBeta + 1, ply + 1);
-                  if (pcScore >= pBeta) {
-                      pcScore = -alphaBeta(board, depth - 4, -pBeta, -pBeta + 1, ply + 1, false, extensions, true);
-                  }
-                  
-                  board.unmakeMove(move);
-                  
-                  if (pcScore >= pBeta) {
-                      return pcScore;
-                  }
-              }
+  // If we are doing well, and a capture beats a high beta margin on a shallow
+  // search, we can safely assume the full search will also fail high and prune
+  // the node.
+  if (!singularSearch && !inCheck && depth >= 5 &&
+      std::abs(beta) < MATE_IN_MAX - MAX_PLY) {
+    int pBeta = beta + 250; // ProbCut Margin
+    bool doProbCut = true;
+
+    // If TT move indicates low score, we skip ProbCut
+    if (ttHit && ttMove != Move(0) && ttDepth >= depth - 3 && ttScore < pBeta) {
+      doProbCut = false;
+    }
+
+    if (doProbCut) {
+      Movelist probcutMoves;
+      MoveGen::generateCaptures(probcutMoves, board);
+      int threshold = pBeta - eval;
+
+      for (const Move &move : probcutMoves) {
+        if (see(board, move) >= threshold) {
+          board.makeMove(move);
+
+          int pcScore = -quiescence(board, -pBeta, -pBeta + 1, ply + 1);
+          if (pcScore >= pBeta) {
+            pcScore = -alphaBeta(board, depth - 4, -pBeta, -pBeta + 1, ply + 1,
+                                 false, extensions, true);
           }
+
+          board.unmakeMove(move);
+
+          if (pcScore >= pBeta) {
+            return pcScore;
+          }
+        }
       }
+    }
   }
 
   // --------------------------------------------------------------
@@ -1550,7 +1156,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
         // This ensures each thread explores different first moves occasionally
         int skipFrequency = std::max(2, shared_->numThreads);
         if ((threadId_ % skipFrequency) == 0) {
-          ttMove = Move(0);  // Force exploration of other root moves
+          ttMove = Move(0); // Force exploration of other root moves
         }
       }
     } else if (ply > 0 && depth >= 8) {
@@ -1572,16 +1178,18 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
           h_->countermove_[prevMove.from().index()][prevMove.to().index()];
     }
   }
-  MovePicker picker(moves, ttMove, &h_->killers_, &h_->history_, &h_->captureHist_, ply, threadId_,
-                    countermove);
+  MovePicker picker(moves, ttMove, &h_->killers_, &h_->history_,
+                    &h_->captureHist_, h_->captures_[ply],
+                    h_->captureScores_[ply], h_->quiets_[ply],
+                    h_->quietScores_[ply], h_->badCaptures_[ply], ply,
+                    threadId_, countermove);
 
   // Futility Pruning
   int lmrDepth = depth;
-  
-  bool canFutilityPrune =
-      !pvNode && !inCheck && depth < 7 &&
-      eval + 98 + 121 * lmrDepth < alpha &&
-      std::abs(alpha) < MATE_IN_MAX;
+
+  bool canFutilityPrune = !pvNode && !inCheck && depth < 7 &&
+                          eval + 98 + 121 * lmrDepth < alpha &&
+                          std::abs(alpha) < MATE_IN_MAX;
 
   // Late Move Pruning threshold
   int lmpThreshold = shared_->config.lmpBase + depth * depth / (2 - improving);
@@ -1590,18 +1198,26 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   int bestScore = -INFINITE;
   Bound ttFlag = Bound::UPPER;
   int movesSearched = 0;
-  Move searchedQuiets[256];
+  std::array<Move, 256> &searchedQuiets = h_->searchedQuiets_[ply];
   int numSearchedQuiets = 0;
 
   // Use MovePicker instead of iterating all moves
   Move move;
   while ((move = picker.nextMove(board, this, inCheck)) != Move(0)) {
-    
-    if (singularSearch && move == excludedMove) continue;
+
+    // Poll stop periodically in the hot move loop to balance latency and NPS.
+    // movesSearched starts at 0, so this still checks immediately on first move.
+    if ((movesSearched & 7) == 0 &&
+        shared_->stop.load(std::memory_order_relaxed))
+      return 0;
+
+    if (singularSearch && move == excludedMove)
+      continue;
 
     uint64_t nodesBeforeMove = 0;
     if (ply == 0) {
-      nodesBeforeMove = shared_->totalNodes.load(std::memory_order_relaxed) + localNodes_;
+      nodesBeforeMove =
+          shared_->totalNodes.load(std::memory_order_relaxed) + localNodes_;
     }
 
     // Check move properties BEFORE making move
@@ -1615,15 +1231,20 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
     int historyScore = h_->history_[move.from().index()][move.to().index()];
 
     if (!isCapt && !pvNode && bestScore > -MATE_IN_MAX) {
-      int lmr_depth = std::max(1, depth - static_cast<int>(LMRTable[std::min(depth, SearchConstants::MAX_PLY)][std::min(movesSearched, 255)]));
+      int lmr_depth = std::max(
+          1, depth - static_cast<int>(
+                         LMRTable[std::min(depth, SearchConstants::MAX_PLY)]
+                                 [std::min(movesSearched, 255)]));
 
       // Late Move Pruning
       if (depth < 6 && movesSearched >= lmpThreshold) {
         // Export pruned move
-        if (isMainThread_ && shared_->exportTree && ply < shared_->exportTreeDepth) {
+        if (isMainThread_ && shared_->exportTree &&
+            ply < shared_->exportTreeDepth) {
           using PR = SearchSharedData::PruneReason;
           shared_->vizTree.push_back({posKey, 0, chess::uci::moveToUci(move),
-              INVALID_EVAL, 0, depth, ply, movesSearched, 0, false, PR::LMP});
+                                      INVALID_EVAL, 0, depth, ply,
+                                      movesSearched, 0, false, PR::LMP});
         }
         continue;
       }
@@ -1631,66 +1252,72 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
       // Futility Pruning
       if (canFutilityPrune && movesSearched > 0) {
         // Export pruned move
-        if (isMainThread_ && shared_->exportTree && ply < shared_->exportTreeDepth) {
+        if (isMainThread_ && shared_->exportTree &&
+            ply < shared_->exportTreeDepth) {
           using PR = SearchSharedData::PruneReason;
           shared_->vizTree.push_back({posKey, 0, chess::uci::moveToUci(move),
-              INVALID_EVAL, 0, depth, ply, movesSearched, 0, false, PR::FUTILITY});
+                                      INVALID_EVAL, 0, depth, ply,
+                                      movesSearched, 0, false, PR::FUTILITY});
         }
         continue;
       }
 
       // History Pruning
-      if (movesSearched > 0 && lmr_depth < 4 && historyScore < -4096 * lmr_depth) {
+      if (movesSearched > 0 && lmr_depth < 4 &&
+          historyScore < -4096 * lmr_depth) {
         continue;
       }
     }
 
     // SEE Pruning
     if (!pvNode && depth < 7 && movesSearched > 0 && !isPromotion &&
-        (movingPiece.type() != PieceType::KING) && 
-        bestScore > -MATE_IN_MAX &&
+        (movingPiece.type() != PieceType::KING) && bestScore > -MATE_IN_MAX &&
         std::abs(alpha) < MATE_IN_MAX) {
-        
+
       int margin = isCapt ? -94 * depth : -86 * depth;
-      
+
       if (see(board, move) < margin) {
         // Export pruned move
-        if (isMainThread_ && shared_->exportTree && ply < shared_->exportTreeDepth) {
+        if (isMainThread_ && shared_->exportTree &&
+            ply < shared_->exportTreeDepth) {
           using PR = SearchSharedData::PruneReason;
           shared_->vizTree.push_back({posKey, 0, chess::uci::moveToUci(move),
-              INVALID_EVAL, 0, depth, ply, movesSearched, 0, false, PR::SEE});
+                                      INVALID_EVAL, 0, depth, ply,
+                                      movesSearched, 0, false, PR::SEE});
         }
         continue;
       }
     }
 
     int extension = 0;
-    
-    // Advanced Singular Extensions
-    if (ply > 0 && ply < currentIter_ * 2 && !singularSearch && depth >= 5 && move == ttMove && 
-        foundBound != Bound::NONE && foundBound != Bound::UPPER &&
-        std::abs(ttScore) < SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY && 
-        ttDepth >= depth - 3) {
-        
-        int ttScorePly = value_from_tt(ttScore, ply);
-        int sBeta = ttScorePly - depth;
-        int sScore = alphaBeta(board, (depth - 1) / 2, sBeta - 1, sBeta,
-                               ply, false, extensions, prevWasCapture, cutnode, move);
 
-        if (sScore < sBeta) {
-            if (!pvNode && sScore + 18 < sBeta && ply < currentIter_) {
-                extension = 2 + (!isCapt && sScore < sBeta - 126);
-            } else {
-                extension = 1;
-            }
-        } else if (sBeta >= beta) {
-    return sBeta;
-        } else if (cutnode) {
-            extension = -1;
+    // Advanced Singular Extensions
+    if (ply > 0 && ply < currentIter_ * 2 && !singularSearch && depth >= 5 &&
+        move == ttMove && foundBound != Bound::NONE &&
+        foundBound != Bound::UPPER &&
+        std::abs(ttScore) <
+            SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY &&
+        ttDepth >= depth - 3) {
+
+      int ttScorePly = ttScore;
+      int sBeta = ttScorePly - depth;
+      int sScore = alphaBeta(board, (depth - 1) / 2, sBeta - 1, sBeta, ply,
+                             false, extensions, prevWasCapture, cutnode, move);
+
+      if (sScore < sBeta) {
+        if (!pvNode && sScore + 18 < sBeta && ply < currentIter_) {
+          extension = 2 + (!isCapt && sScore < sBeta - 126);
+        } else {
+          extension = 1;
         }
+      } else if (sBeta >= beta) {
+        return sBeta;
+      } else if (cutnode) {
+        extension = -1;
+      }
     }
 
-    // Bug #1 fix: Record moving piece BEFORE makeMove (after makeMove, from() is empty)
+    // Record moving piece before makeMove (after makeMove, the square is empty)
     Piece movingPieceCopy = board.at(move.from());
     board.makeMove(move);
     prevMove_[ply] = move; // Track move for child nodes (recapture/countermove)
@@ -1719,18 +1346,18 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
       int movesIdx = std::min(movesSearched, 255);
       int depthIdx = std::min(depth, SearchConstants::MAX_PLY);
       int reduction = static_cast<int>(LMRTable[depthIdx][movesIdx]);
-      
+
       if (isCapt || isPromotion) {
-          reduction /= 2;
+        reduction /= 2;
       } else {
-          int historyScore = h_->history_[move.from().index()][move.to().index()];
-          reduction -= historyScore / 9818;
+        int historyScore = h_->history_[move.from().index()][move.to().index()];
+        reduction -= historyScore / 9818;
       }
 
       reduction -= (ttHit && ttDepth >= depth) ? 1 : 0;
-      
+
       // Use the improving flag computed earlier
-      
+
       reduction += !improving ? 1 : 0;
       reduction += cutnode ? 1 : 0;
 
@@ -1741,7 +1368,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
 
       // reduce less if move gives check
       reduction -= givesCheck ? 1 : 0;
-      
+
       // SMP Diversification
       if (threadId_ > 0) {
         int lmrVariation = (threadId_ % 3) - 1; // -1, 0, or +1
@@ -1752,16 +1379,20 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
       reduction = std::clamp(reduction, 0, newDepth - 1);
 
       // Reduced depth search with null window
-      score = -alphaBeta(board, newDepth - reduction, -alpha - 1, -alpha, ply + 1, true, newExtensions, isCapt || isPromotion, true);
+      score =
+          -alphaBeta(board, newDepth - reduction, -alpha - 1, -alpha, ply + 1,
+                     true, newExtensions, isCapt || isPromotion, true);
 
       // Re-search at full depth if reduced search improved alpha
       if (score > alpha) {
-        score = -alphaBeta(board, newDepth, -alpha - 1, -alpha, ply + 1, true, newExtensions, isCapt || isPromotion, !cutnode);
+        score = -alphaBeta(board, newDepth, -alpha - 1, -alpha, ply + 1, true,
+                           newExtensions, isCapt || isPromotion, !cutnode);
 
         // Full window re-search for PV nodes if still beats alpha (important
         // for finding mates!)
         if (pvNode && score > alpha && score < beta) {
-          score = -alphaBeta(board, newDepth, -beta, -alpha, ply + 1, true, newExtensions, isCapt || isPromotion, false);
+          score = -alphaBeta(board, newDepth, -beta, -alpha, ply + 1, true,
+                             newExtensions, isCapt || isPromotion, false);
         }
       }
     } else if (!pvNode || movesSearched > 0) {
@@ -1772,59 +1403,61 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
         score = -alphaBeta(board, newDepth, -beta, -alpha, ply + 1, true,
                            newExtensions, isCapt || isPromotion, !cutnode);
       } else {
-        score = -alphaBeta(board, newDepth, -alpha - 1, -alpha, ply + 1, true, newExtensions, isCapt || isPromotion, !cutnode);
+        score = -alphaBeta(board, newDepth, -alpha - 1, -alpha, ply + 1, true,
+                           newExtensions, isCapt || isPromotion, !cutnode);
       }
     } else {
       score = alpha + 1;
     }
 
     if (pvNode && score > alpha && (movesSearched > 0 || score < beta)) {
-      score = -alphaBeta(board, newDepth, -beta, -alpha, ply + 1, true, newExtensions, isCapt || isPromotion, false);
+      score = -alphaBeta(board, newDepth, -beta, -alpha, ply + 1, true,
+                         newExtensions, isCapt || isPromotion, false);
     }
 
     // --- Search Tree Export (Main Thread Only) ---
     if (isMainThread_ && shared_->exportTree) {
       bool inExportRange = (ply < shared_->exportTreeDepth);
       bool isPVMove = (score > alpha);
-      
+
       if (inExportRange || isPVMove) {
         // Try to retrieve the child's static eval from the TT
         // It was computed and stored inside the child's alphaBeta call
         int16_t childEval;
         int exportStaticEval = 0;
-        
+
         // Probe TT for the child position
         if (tt_.probeEval(board.hash(), childEval)) {
-           // Negate because child's eval is from side-to-move (child's perspective)
-           // We want it from parent's perspective
-           exportStaticEval = -static_cast<int>(childEval);
+          // Negate because child's eval is from side-to-move (child's
+          // perspective) We want it from parent's perspective
+          exportStaticEval = -static_cast<int>(childEval);
         } else {
-           // No eval found in TT for this child position
-           // Use sentinel value to indicate "not evaluated"
-           exportStaticEval = INVALID_EVAL; 
+          // No eval found in TT for this child position
+          // Use sentinel value to indicate "not evaluated"
+          exportStaticEval = INVALID_EVAL;
         }
 
         using PR = SearchSharedData::PruneReason;
-        shared_->vizTree.push_back({
-            posKey,              // Parent Hash
-            board.hash(),        // Child Hash (current board before unmake)
-            chess::uci::moveToUci(move),
-            exportStaticEval,    // Static eval of CHILD position (or sentinel)
-            score,               // Search score (backed up)
-            depth,               // Remaining depth
-            ply,                 // Ply from root
-            movesSearched,       // Move order (0-indexed, before increment)
-            0,                   // subtreeNodes - TODO: track per-move
-            isPVMove,            // Is this on PV?
-            score >= beta ? PR::BETA_CUTOFF : PR::NONE
-        });
+        shared_->vizTree.push_back(
+            {posKey,       // Parent Hash
+             board.hash(), // Child Hash (current board before unmake)
+             chess::uci::moveToUci(move),
+             exportStaticEval, // Static eval of CHILD position (or sentinel)
+             score,            // Search score (backed up)
+             depth,            // Remaining depth
+             ply,              // Ply from root
+             movesSearched,    // Move order (0-indexed, before increment)
+             0,                // subtreeNodes
+             isPVMove,         // Is this on PV?
+             score >= beta ? PR::BETA_CUTOFF : PR::NONE});
       }
     }
 
     board.unmakeMove(move);
-    
+
     if (ply == 0) {
-      uint64_t nodesAfterMove = shared_->totalNodes.load(std::memory_order_relaxed) + localNodes_;
+      uint64_t nodesAfterMove =
+          shared_->totalNodes.load(std::memory_order_relaxed) + localNodes_;
       uint16_t moveIndex = (move.from().index() << 6) | move.to().index();
       rootNodeCounts_[moveIndex] += (nodesAfterMove - nodesBeforeMove);
       searchNodes_ += (nodesAfterMove - nodesBeforeMove);
@@ -1835,10 +1468,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
     if (shared_->stop)
       return 0;
 
-    // Print root evaluation scores only when UCI debug mode is tracked on
-    if (ply == 0 && tt_.isDebugMode()) {
-      std::cout << "info string ROOT EVAL move=" << chess::uci::moveToUci(move) << " score=" << score << std::endl;
-    }
+
 
     if (score > bestScore) {
       bestScore = score;
@@ -1870,10 +1500,10 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
           // Update killers and history for quiet moves
           if (isQuiet) {
             updateKillers(move, ply);
-            
+
             int bonus = std::min(
                 291 * (depth - 1 + (score > beta + 125 ? 1 : 0)), 2476);
-            
+
             updateHistory(board, move, bonus, ply);
 
             // History Malus: penalize all other searched quiets
@@ -1899,7 +1529,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
             int attackerType = static_cast<int>(movingPiece.type());
             int toSq = move.to().index();
             int bonus = std::min(291 * (depth - 1), 2476);
-            int& entry = h_->captureHist_[attackerType][toSq];
+            int &entry = h_->captureHist_[attackerType][toSq];
             entry = entry + bonus - entry * std::abs(bonus) / 16384;
           }
           break;
@@ -1909,39 +1539,42 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   }
 
   // --- Eval Correction History Update ---
-  // FIX: Use the CORRECTED 'eval' for conditions and bonus, NOT the raw 'staticEvalToStore'
-  if (shared_->config.enableCorrHist && !inCheck && (bestMove == Move(0) || !isCapture(board, bestMove)) &&
+  // Use the history-corrected 'eval' for conditions and bonus, not the raw eval.
+  if (std::abs(eval) < SearchConstants::TB_WIN_IN_MAX && shared_->config.enableCorrHist && !inCheck &&
+      (bestMove == Move(0) || !isCapture(board, bestMove)) &&
       !(bestScore >= betaOriginal && bestScore <= eval) &&
       !(bestMove == Move(0) && bestScore >= eval)) {
-      
-      // Ensure eval is valid and we are not in mate scores
-      if (eval != SearchConstants::INVALID_EVAL && 
-          bestScore > -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY && 
-          bestScore < SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY) {
-          
-          // CALCULATE BONUS USING CORRECTED EVAL
-          int bonus = std::clamp((bestScore - eval) * depth / 8, -256, 256);
-          
-          int pc = static_cast<int>(board.sideToMove());
-          uint64_t pKey = getPawnKey(board) % 16384;
-          uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
-          uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
-          
-          auto update_corr = [](int16_t& entry, int b) {
-              entry = entry + b - entry * std::abs(b) / 1024;
-          };
-          update_corr(h_->pawnCorrHist_[pc][pKey], bonus);
-          update_corr(h_->nonPawnCorrHist_[pc][0][npKeyW], bonus);
-          update_corr(h_->nonPawnCorrHist_[pc][1][npKeyB], bonus);
 
-          if (ply >= 2 && prevMove_[ply - 1] != Move(0) && prevMove_[ply - 2] != Move(0)
-              && prevPiece_[ply - 1] != Piece::NONE && prevPiece_[ply - 2] != Piece::NONE) {
-              int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
-              int pTo2 = prevMove_[ply - 2].to().index();
-              int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
-              update_corr(h_->contCorrHist_[pPiece2][pTo2][pPiece1][pTo2], bonus);
-          }
+    // Ensure eval is valid and we are not in mate scores
+    if (eval != SearchConstants::INVALID_EVAL &&
+        bestScore > -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY &&
+        bestScore < SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY) {
+
+      // CALCULATE BONUS USING CORRECTED EVAL
+      int bonus = std::clamp((bestScore - eval) * depth / 8, -256, 256);
+
+      int pc = static_cast<int>(board.sideToMove());
+      uint64_t pKey = getPawnKey(board) % 16384;
+      uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
+      uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
+
+      auto update_corr = [](int16_t &entry, int b) {
+        entry = entry + b - entry * std::abs(b) / 1024;
+      };
+      update_corr(h_->pawnCorrHist_[pc][pKey], bonus);
+      update_corr(h_->nonPawnCorrHist_[pc][0][npKeyW], bonus);
+      update_corr(h_->nonPawnCorrHist_[pc][1][npKeyB], bonus);
+
+      if (ply >= 2 && prevMove_[ply - 1] != Move(0) &&
+          prevMove_[ply - 2] != Move(0) && prevPiece_[ply - 1] != Piece::NONE &&
+          prevPiece_[ply - 2] != Piece::NONE) {
+        int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
+        int pTo2 = prevMove_[ply - 2].to().index();
+        int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
+        int pTo1 = prevMove_[ply - 1].to().index();
+        update_corr(h_->contCorrHist_[pPiece2][pTo2][pPiece1][pTo1], bonus);
       }
+    }
   }
 
   // Determine the raw eval to store in the TT
@@ -1949,7 +1582,7 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
   if (evalComputed) {
     staticEvalToStore = rawEval; // TT still gets the raw eval!
   } else if (ttEvalHit) {
-    staticEvalToStore = cachedScore; 
+    staticEvalToStore = cachedScore;
   }
 
   if (!singularSearch) {
@@ -1961,8 +1594,13 @@ int Negamax::alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
 }
 
 int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
+  if (ply > localSelDepth_) {
+    localSelDepth_ = ply;
+  }
+
   // Time check in quiescence
-  if ((localNodes_ & 1023) == 0) {
+  // Check stop more often to reduce stop->bestmove latency in endgames.
+  if ((localNodes_ & 255) == 0) {
     if (shouldStop())
       return 0;
   }
@@ -1974,12 +1612,18 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
   if (ply >= MAX_PLY - 1 || ply >= MAX_QSEARCH_PLY) {
     int16_t cachedScore;
     uint64_t posKey = board.hash();
+    int rawEval;
+
     if (tt_.probeEval(posKey, cachedScore)) {
-      return cachedScore;
+      rawEval = cachedScore;
+    } else {
+      rawEval = evalCtx_.evaluate(board, ply);
+      tt_.storeEval(posKey, static_cast<int16_t>(rawEval));
     }
-    int e = evalCtx_.evaluate(board);
-    tt_.storeEval(posKey, static_cast<int16_t>(e));
-    return e;
+
+    int staticEval = applyCorrHist(rawEval, board, ply);
+
+    return staticEval;
   }
 
   bool inCheck = board.inCheck();
@@ -1990,8 +1634,10 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
   int ttScore;
   int ttDepth = -1;
   Bound foundBound = Bound::NONE;
-  bool ttHit = tt_.probe(posKey, 0, alpha, beta, ttScore, ttMove, ttDepth,
-                         foundBound);
+  bool ttHit = tt_.probe(posKey, 0, ttScore, ttMove, ttDepth, foundBound);
+  if (ttHit) {
+    ++localTtHits_;
+  }
 
   int rawEval = SearchConstants::INVALID_EVAL;
   int ttStaticEval = SearchConstants::INVALID_EVAL;
@@ -2020,27 +1666,12 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
     if (tt_.probeEval(posKey, cachedScore)) {
       rawEval = cachedScore;
     } else {
-      rawEval = evalCtx_.evaluate(board);
+      rawEval = evalCtx_.evaluate(board, ply);
       tt_.storeEval(posKey, static_cast<int16_t>(rawEval));
     }
 
     // Apply correction history
-    // FIX: Must manually cast halfMoveClock to int, otherwise the entire expression
-    // evaluates as unsigned, converting negative rawEvals into 4.29B unsigned ints 
-    // which divided by 200 gives the cursed 21474221 values!
-    staticEval = rawEval * (200 - static_cast<int>(board.halfMoveClock())) / 200;
-    if (shared_->config.enableCorrHist) {
-      int pc = static_cast<int>(board.sideToMove());
-      uint64_t pKey = getPawnKey(board) % 16384;
-      uint64_t npKeyW = getNonPawnKey(board, chess::Color::WHITE) % 16384;
-      uint64_t npKeyB = getNonPawnKey(board, chess::Color::BLACK) % 16384;
-      int correction = h_->pawnCorrHist_[pc][pKey] +
-                       h_->nonPawnCorrHist_[pc][0][npKeyW] +
-                       h_->nonPawnCorrHist_[pc][1][npKeyB];
-      staticEval = std::clamp(staticEval + shared_->config.corrWeight * correction / 512,
-                              -SearchConstants::MATE_SCORE + SearchConstants::MAX_PLY,
-                              SearchConstants::MATE_SCORE - SearchConstants::MAX_PLY);
-    }
+    staticEval = applyCorrHist(rawEval, board, ply);
 
     bestScore = staticEval;
 
@@ -2069,24 +1700,38 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
       return -mateScore(ply);
     }
     if (ply >= MAX_QSEARCH_PLY) {
-      if (rawEval != SearchConstants::INVALID_EVAL) return rawEval;
-      int e = evalCtx_.evaluate(board);
+      if (rawEval != SearchConstants::INVALID_EVAL)
+        return rawEval;
+      int e = evalCtx_.evaluate(board, ply);
       tt_.storeEval(posKey, static_cast<int16_t>(e));
       return e;
     }
   } else {
     MoveGen::generateCaptures(moves, board);
+
+    // Note: chess.hpp's CAPTURE mode skips non-capture promotions.
+    // We generate them explicitly here to ensure they are evaluated in quiescence.
+    {
+      Movelist allMoves;
+      MoveGen::generateLegalMoves(allMoves, board);
+      for (const auto &m : allMoves) {
+        if (m.typeOf() == Move::PROMOTION && board.at(m.to()) == Piece::NONE) {
+          moves.add(m);
+        }
+      }
+    }
   }
 
   // MVV-LVA scoring
   for (auto &m : moves) {
     int score = 0;
+    int attackerType = static_cast<int>(board.at(m.from()).type());
     if (m.typeOf() == Move::ENPASSANT) {
-      score = static_cast<int>(PieceType::PAWN) * 100;
+      score = static_cast<int>(PieceType::PAWN) * 100 - attackerType;
     } else {
       Piece captured = board.at(m.to());
       if (captured != Piece::NONE) {
-        score = static_cast<int>(captured.type()) * 100;
+        score = static_cast<int>(captured.type()) * 100 - attackerType;
       }
     }
     if (m.typeOf() == Move::PROMOTION) {
@@ -2102,13 +1747,14 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
 
   for (const Move &move : moves) {
     // Skip non-captures when not in check
-    if (!inCheck && board.at(move.to()) == Piece::NONE && 
+    if (!inCheck && board.at(move.to()) == Piece::NONE &&
         move.typeOf() != Move::ENPASSANT && move.typeOf() != Move::PROMOTION) {
       continue;
     }
 
     // Delta pruning
-    if (!inCheck && staticEval != SearchConstants::INVALID_EVAL && move.typeOf() != Move::PROMOTION) {
+    if (!inCheck && staticEval != SearchConstants::INVALID_EVAL &&
+        move.typeOf() != Move::PROMOTION) {
       Piece captured = board.at(move.to());
       int captureValue = 0;
       if (captured != Piece::NONE) {
@@ -2124,18 +1770,17 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
     // SEE filtering
     if (!inCheck && move.typeOf() != Move::ENPASSANT &&
         see(board, move) < -107) {
-      continue;  // Skip bad captures
+      continue; // Skip bad captures
     }
-    
-    movesPlayed++;
 
+    movesPlayed++;
 
     board.makeMove(move);
     int score = -quiescence(board, -beta, -alpha, ply + 1);
     board.unmakeMove(move);
 
     if (shared_->stop)
-    return bestScore > -SearchConstants::INFINITE ? bestScore : 0;
+      return bestScore > -SearchConstants::INFINITE ? bestScore : 0;
 
     if (score > bestScore) {
       bestScore = score;
@@ -2163,7 +1808,7 @@ int Negamax::quiescence(Board &board, int alpha, int beta, int ply) {
   // Store TT entry
   // TT::store() clamps scores to int16_t range automatically
   Bound entryType = bestScore >= beta ? Bound::LOWER
-                  : raisedAlpha       ? Bound::EXACT
+                    : raisedAlpha     ? Bound::EXACT
                                       : Bound::UPPER;
 
   tt_.store(posKey, 0, value_to_tt(bestScore, ply), entryType, bestMove,
@@ -2182,7 +1827,7 @@ void Negamax::updateKillers(Move move, int ply) {
   }
 }
 
-void Negamax::updateHistory(const Board& board, Move move, int bonus, int ply) {
+void Negamax::updateHistory(const Board &board, Move move, int bonus, int ply) {
   int fromSq = move.from().index();
   int toSq = move.to().index();
   int piece = static_cast<int>(board.at(move.from()));
@@ -2190,14 +1835,14 @@ void Negamax::updateHistory(const Board& board, Move move, int bonus, int ply) {
   // Exponential gravity update
   int entry = h_->history_[fromSq][toSq];
   h_->history_[fromSq][toSq] = entry + bonus - entry * std::abs(bonus) / 16384;
-  
+
   // Continuation History update
   if (ply >= 1) {
     Move prev1 = prevMove_[ply - 1];
     if (prev1 != Move(0)) {
       int pPiece1 = static_cast<int>(prevPiece_[ply - 1]);
       int pTo1 = prev1.to().index();
-      int& ch1 = h_->contHist_[pPiece1][pTo1][piece][toSq];
+      int &ch1 = h_->contHist_[pPiece1][pTo1][piece][toSq];
       ch1 = ch1 + bonus - ch1 * std::abs(bonus) / 16384;
     }
   }
@@ -2206,7 +1851,7 @@ void Negamax::updateHistory(const Board& board, Move move, int bonus, int ply) {
     if (prev2 != Move(0)) {
       int pPiece2 = static_cast<int>(prevPiece_[ply - 2]);
       int pTo2 = prev2.to().index();
-      int& ch2 = h_->contHist_[pPiece2][pTo2][piece][toSq];
+      int &ch2 = h_->contHist_[pPiece2][pTo2][piece][toSq];
       ch2 = ch2 + bonus - ch2 * std::abs(bonus) / 16384;
     }
   }
@@ -2216,7 +1861,7 @@ void Negamax::updateHistory(const Board& board, Move move, int bonus, int ply) {
       int pPiece4 = static_cast<int>(prevPiece_[ply - 4]);
       int pTo4 = prev4.to().index();
       int b4 = bonus / 2;
-      int& ch4 = h_->contHist_[pPiece4][pTo4][piece][toSq];
+      int &ch4 = h_->contHist_[pPiece4][pTo4][piece][toSq];
       ch4 = ch4 + b4 - ch4 * std::abs(b4) / 16384;
     }
   }
@@ -2236,26 +1881,32 @@ bool Negamax::shouldStopIteration(int depth, int score, Move bestMove) const {
   TimeManager::TimeAllocation currentAlloc = timeAlloc_;
   currentAlloc.softLimit = shared_->softLimit;
   currentAlloc.hardLimit = shared_->hardLimit;
-  
+
   // Phase 2:
-  // Compares nodes spent on the best move vs total nodes to scale time allocation
+  // Compares nodes spent on the best move vs total nodes to scale time
+  // allocation
   if (searchNodes_ > 0 && bestMove != Move(0)) {
     uint16_t moveIndex = (bestMove.from().index() << 6) | bestMove.to().index();
     uint64_t bestMoveNodes = rootNodeCounts_[moveIndex];
-    double fract = static_cast<double>(bestMoveNodes) / static_cast<double>(searchNodes_);
-    
+    double fract =
+        static_cast<double>(bestMoveNodes) / static_cast<double>(searchNodes_);
+
     // NodeTmFactors and bmStability
     int bmStability = std::max(0, depth - bestMoveChanges_);
     double factor = (1.81 - fract) * 2.15;
     double bmFactor = 1.27 - (bmStability * 0.06);
-    
+
     // Scale soft limit dynamically
-    int64_t scaledSoft = static_cast<int64_t>(currentAlloc.softLimit * factor * bmFactor);
-    
-    // Don't let it drop below 10% of the original soft limit to avoid skipping critical depths entirely
-    currentAlloc.softLimit = std::max(currentAlloc.softLimit / 10, std::min(scaledSoft, currentAlloc.hardLimit));
+    int64_t scaledSoft =
+        static_cast<int64_t>(currentAlloc.softLimit * factor * bmFactor);
+
+    // Don't let it drop below 10% of the original soft limit to avoid skipping
+    // critical depths entirely
+    currentAlloc.softLimit =
+        std::max(currentAlloc.softLimit / 10,
+                 std::min(scaledSoft, currentAlloc.hardLimit));
   }
-  
+
   // Delegate to TimeManager
   return timeManager_.shouldStop(elapsedMs(), depth, bestMoveChanges_,
                                  scoreDrops_, currentAlloc);
@@ -2269,36 +1920,48 @@ bool Negamax::shouldStop() const {
   if (!isMainThread_)
     return false;
 
-  // Main thread checks hard limit every 128 nodes
+  // Main thread checks hard limit every 1023 nodes.
+  // This keeps stop latency sub-millisecond at typical NPS while reducing
+  // steady_clock::now() overhead in hot search loops.
   // CRITICAL: Use localNodes_ for frequency, not shared counter!
   // shared_->totalNodes is only flushed at end of each depth, so during
   // a long iteration it would never trigger time checks.
   //
   // IMPORTANT: Read hardLimit from shared_ (not timeAlloc_) to support
   // dynamic time updates from ponderhit. When ponderhit arrives, UCI
-  // updates shared_->hardLimit and shared_->startTime, and the search
+  // updates shared_->hardLimit and shared_->startTimeNs, and the search
   // will pick up the new limits here.
+  constexpr uint64_t kHardLimitCheckMask = 1023; // every 1024 nodes
   int64_t hardLimit = shared_->hardLimit;
-  if ((localNodes_ & 127) == 0 && hardLimit > 0) {
+  if ((localNodes_ & kHardLimitCheckMask) == 0 && hardLimit > 0) {
     int64_t elapsed = elapsedMs();
     // Hard limit check - stop when exceeded
     if (elapsed >= hardLimit) {
       shared_->stop = true;
-    return true;
+      return true;
     }
   }
-    return false;
+  return false;
 }
 
 int64_t Negamax::elapsedMs() const {
-  auto now = std::chrono::steady_clock::now();
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             now - shared_->startTime)
-      .count();
+  const int64_t startNs = shared_->startTimeNs.load(std::memory_order_relaxed);
+  if (startNs <= 0)
+    return 0;
+
+  const int64_t nowNs =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+
+  if (nowNs <= startNs)
+    return 0;
+
+  return (nowNs - startNs) / 1000000;
 }
 
 bool Negamax::isCapture(const Board &board, Move move) const {
-    return board.at(move.to()) != Piece::NONE || move.typeOf() == Move::ENPASSANT;
+  return board.at(move.to()) != Piece::NONE || move.typeOf() == Move::ENPASSANT;
 }
 
 bool Negamax::isDraw(const Board &board) const {
@@ -2311,7 +1974,7 @@ bool Negamax::isDraw(const Board &board) const {
     return true;
 
   // Insufficient material is handled by chess.hpp if needed
-    return false;
+  return false;
 }
 
 int Negamax::mateScore(int ply) const { return MATE_SCORE - ply; }
@@ -2342,9 +2005,15 @@ int Negamax::see(const Board &board, Move move) const {
                   : 0;
   }
 
+  // Include net promotion gain (promoted piece minus pawn)
+  if (move.typeOf() == Move::PROMOTION) {
+    gain[0] += SEE_PIECE_VALUES[static_cast<int>(move.promotionType())] -
+               SEE_PIECE_VALUES[0];
+  }
+
   // Quick exit for non-captures (optional, but good for performance)
   if (gain[0] == 0 && move.typeOf() != Move::ENPASSANT) {
-      return 0;
+    return 0;
   }
 
   Bitboard occupied = board.occ();
@@ -2356,8 +2025,8 @@ int Negamax::see(const Board &board, Move move) const {
     occupied ^= Bitboard::fromSquare(capturedPawnSq);
   }
 
-  // 2. CRITICAL FIX: The piece standing on toSq for the NEXT capture is the
-  //    piece that just moved (the attacker), NOT the captured piece.
+  // Note: The piece standing on toSq for the NEXT capture is the
+  // piece that just moved (the attacker), not the captured piece.
   PieceType pieceOnToSq;
   if (move.typeOf() == Move::PROMOTION) {
     pieceOnToSq = move.promotionType();
@@ -2441,14 +2110,14 @@ int Negamax::see(const Board &board, Move move) const {
   }
 
   while (depth > 0) {
-    gain[depth - 1] = -std::max(0, gain[depth]);
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
     depth--;
   }
-    return gain[0];
+  return gain[0];
 }
 
 int Negamax::pieceValue(PieceType pt) const {
-    return SEE_PIECE_VALUES[static_cast<int>(pt)];
+  return SEE_PIECE_VALUES[static_cast<int>(pt)];
 }
 
 // Check if a pawn is a passed pawn
@@ -2465,7 +2134,7 @@ bool Negamax::isPassedPawn(const Board &board, Square sq, Color side) const {
         Piece p = board.at(checkSq);
         if (p != Piece::NONE && p.type() == PieceType::PAWN &&
             p.color() == Color::BLACK) {
-    return false;
+          return false;
         }
       }
     } else {
@@ -2474,13 +2143,13 @@ bool Negamax::isPassedPawn(const Board &board, Square sq, Color side) const {
         Piece p = board.at(checkSq);
         if (p != Piece::NONE && p.type() == PieceType::PAWN &&
             p.color() == Color::WHITE) {
-    return false;
+          return false;
         }
       }
     }
   }
 
-    return true;
+  return true;
 }
 
 // Check if move is a pawn push to the 7th rank (pre-promotion)

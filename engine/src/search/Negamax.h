@@ -1,6 +1,14 @@
-  #pragma once
-// Negamax.h - Alpha-Beta search with enhancements
-// Implements: Iterative Deepening, TT cutoffs, LMR, Null Move, Killer/History
+#pragma once
+
+/**
+ * @file Negamax.h
+ * @brief Alpha-Beta search implementation with enhancements.
+ *
+ * Implements the core search algorithm using the Negamax framework with 
+ * Alpha-Beta pruning, Iterative Deepening, Transposition Tables, Late Move 
+ * Reductions (LMR), Null Move Pruning, and various move ordering heuristics 
+ * (Killer, History, Countermove).
+ */
 
 #include "../eval/IEvaluator.h"
 #include "../eval/SimpleEvalContext.h"
@@ -11,215 +19,248 @@
 #include <array>
 #include <chrono>
 
-// Forward declarations
-class Negamax;
+#include "MovePicker.h"
+#include "SearchHeuristics.h"
 
-// MovePicker: Lazily selects the best move at each step
-// Avoids sorting all moves upfront - crucial for cutoff-heavy nodes
-class MovePicker {
-private:
-  Movelist allMoves_;          // All legal moves (generated once)
-  
-  // === OPTIMIZATION: Fixed-size arrays to avoid dynamic allocations ===
-  // Max legal moves in any chess position is 218, but typical positions have <50
-  static constexpr int MAX_MOVES = 256;
-  std::array<Move, MAX_MOVES> captures_;
-  std::array<int, MAX_MOVES> captureScores_;
-  int captureCount_ = 0;
-  
-  std::array<Move, 2> killerMoves_; // Killer moves (max 2)
-  int killerCount_ = 0;
-  
-  std::array<Move, MAX_MOVES> quiets_;
-  std::array<int, MAX_MOVES> quietScores_;
-  int quietCount_ = 0;
-  
-  Move ttMove_;      // Best move from TT (searched first)
-  Move countermove_; // Countermove for opponent's previous move
-  const std::array<std::array<Move, 2>, SearchConstants::MAX_PLY> *killers_;
-  const std::array<std::array<int, 64>, 64> *history_;
-  const std::array<std::array<int, 64>, 16> *captureHist_;
-  int ply_;
-  int threadId_; // Thread ID for diversified move ordering
-
-  int nextCapture_ = 0;
-  int nextKiller_ = 0;
-  int nextQuiet_ = 0;
-  std::array<Move, MAX_MOVES> badCaptures_;
-  int badCaptureCount_ = 0;
-  int nextBadCapture_ = 0;
-  bool capturesGenerated_ = false;
-  bool killersGenerated_ = false;
-  bool quietsGenerated_ = false;
-  int nextQueenPromo_ = 0;
-  int queenPromoCount_ = 0;
-  bool countermoveReturned_ = false;
-  int phase_ = 0; // 0: Queen promos, 1: TT move, 2: captures, 3: killers, 4:
-                  // countermove, 5: quiets, 6: bad captures
-
-public:
-  MovePicker(
-      const Movelist &moves, Move ttMove,
-      const std::array<std::array<Move, 2>, SearchConstants::MAX_PLY> *killers,
-      const std::array<std::array<int, 64>, 64> *history,
-      const std::array<std::array<int, 64>, 16> *captureHist,
-      int ply, int threadId = 0, Move countermove = Move(0))
-      : allMoves_(moves), ttMove_(ttMove), countermove_(countermove),
-        killers_(killers), history_(history), captureHist_(captureHist), 
-        ply_(ply), threadId_(threadId) {}
-
-  // Get next best move
-  Move nextMove(const Board &board, const Negamax *search, bool inCheck);
-
-private:
-  int scoreMove(const Move &move, const Board &board, const Negamax *search,
-                bool isCapture);
-  void generateAndScoreCaptures(const Board &board, const Negamax *search);
-  void generateAndScoreKillers(const Board &board, const Negamax *search);
-  void generateAndScoreQuiets(const Board &board, const Negamax *search);
-  
-  // Template for fixed-size array selection (avoids heap allocations)
-  template<size_t N>
-  Move selectBestMove(std::array<Move, N> &list, std::array<int, N> &scores,
-                      int &nextIdx, int count);
-};
-
-// SearchHeuristics: Large search data structures consolidated for heap allocation
-struct SearchHeuristics {
-  std::array<std::array<Move, 2>, SearchConstants::MAX_PLY> killers_{};
-  std::array<std::array<int, 64>, 64> history_{};
-  std::array<std::array<Move, 64>, 64> countermove_{};
-  std::array<std::array<std::array<std::array<int, 64>, 16>, 64>, 16> contHist_{};
-  std::array<std::array<int, 64>, 16> captureHist_{};
-  std::array<std::array<int16_t, 16384>, 2> pawnCorrHist_{};
-  std::array<std::array<std::array<int16_t, 16384>, 2>, 2> nonPawnCorrHist_{};
-  std::array<std::array<std::array<std::array<int16_t, 64>, 16>, 64>, 16> contCorrHist_{};
-  std::array<std::array<Move, SearchConstants::MAX_PLY>, SearchConstants::MAX_PLY> pvTable_{};
-  std::array<int, SearchConstants::MAX_PLY> failHighCount_{};
-};
-
+/**
+ * @class Negamax
+ * @brief Implementation of the main Alpha-Beta search algorithm.
+ *
+ * This class encapsulates the search state for a single thread, including
+ * local transposition table statistics, move ordering heuristics, and time management.
+ * It coordinates with other search threads through `SearchSharedData`.
+ */
 class Negamax : public ISearch {
   // Grant MovePicker access to heap-allocated heuristics
   friend class MovePicker;
 
 private:
-  // Search context
-  IEvaluator &evalCtx_;
-  TranspositionTable &tt_;
+  IEvaluator &evalCtx_;              ///< Reference to the thread-local evaluator.
+  TranspositionTable &tt_;           ///< Reference to the global transposition table.
 
   // LAZY SMP: Shared State
-  std::shared_ptr<SearchSharedData> shared_;
-  bool isMainThread_;
-  int threadId_; // Thread ID for diversified move ordering
+  std::shared_ptr<SearchSharedData> shared_; ///< Shared state for thread coordination.
+  bool isMainThread_;                ///< True if this is the primary search thread.
+  int threadId_;                     ///< Unique ID for this thread (used for move ordering diversity).
 
-  // Thread-local node counter (flush to shared periodically to avoid
-  // contention)
-  uint64_t localNodes_ = 0;
-  static constexpr uint64_t NODE_FLUSH_INTERVAL = 1024;
+  // Thread-local statistics
+  uint64_t localNodes_ = 0;          ///< Nodes searched by this thread.
+  uint64_t localTbHits_ = 0;         ///< Tablebase hits by this thread.
+  uint64_t localTtHits_ = 0;         ///< TT hits by this thread.
+  int localSelDepth_ = 0;            ///< Maximum selective depth reached by this thread.
+  static constexpr uint64_t NODE_FLUSH_INTERVAL = 1024; ///< How often to flush local stats to the shared global counters.
 
   // Time management
-  TimeManager timeManager_;
-  TimeManager::TimeAllocation timeAlloc_{};
-  float lastEvalCp_ = 0.0f; // Last search eval for time decisions
+  TimeManager timeManager_;                  ///< Manages time limits and soft/hard stops.
+  TimeManager::TimeAllocation timeAlloc_{};  ///< Pre-calculated time allocation constraints.
+  float lastEvalCp_ = 0.0f;                  ///< Last evaluation score in centipawns (used for time decisions).
 
-  // Time management state (for dynamic adjustment)
-  Move lastBestMove_;       // Best move from previous iteration
-  int lastScore_ = 0;       // Score from previous iteration
-  int bestMoveChanges_ = 0; // How many times best move changed
-  int scoreDrops_ = 0;      // How many times score dropped significantly
-  std::array<uint64_t, 4096> rootNodeCounts_{}; // Nodes spent on each root move
-  uint64_t searchNodes_ = 0; // Total nodes this search
+  // Iteration state tracking
+  Move lastBestMove_;                ///< Best move found in the previous iterative deepening iteration.
+  int lastScore_ = 0;                ///< Score returned in the previous iteration.
+  int bestMoveChanges_ = 0;          ///< Count of how many times the best move changed at root.
+  int scoreDrops_ = 0;               ///< Count of significant evaluation drops at root.
+  std::array<uint64_t, 4096> rootNodeCounts_{}; ///< Number of nodes spent evaluating each root move.
+  uint64_t searchNodes_ = 0;         ///< Total nodes searched during the current search session.
 
-  // Heap-allocated heuristics to prevent stack overflow
-  std::unique_ptr<SearchHeuristics> h_;
+  std::unique_ptr<SearchHeuristics> h_; ///< Heap-allocated structure containing large arrays for search heuristics.
 
-  // Zobrist helper functions
+  /**
+   * @brief Computes a hash key based on the pawn structure.
+   * @param board The current board state.
+   * @return The 64-bit Zobrist key for pawns only.
+   */
   uint64_t getPawnKey(const Board& board) const;
+
+  /**
+   * @brief Computes a hash key based on non-pawn pieces of a given color.
+   * @param board The current board state.
+   * @param c The color of the pieces to hash.
+   * @return The 64-bit non-pawn Zobrist key.
+   */
   uint64_t getNonPawnKey(const Board& board, Color c) const;
 
-  // Previous move tracking for recapture extension and countermove
-  std::array<Move, SearchConstants::MAX_PLY>
-      prevMove_; // [ply] -> move made at that ply
-  std::array<Piece, SearchConstants::MAX_PLY>
-      prevPiece_{}; // [ply] -> piece that moved
+  // Search context tracking arrays
+  std::array<Move, SearchConstants::MAX_PLY> prevMove_;  ///< Records the move made at each ply to reach the current state.
+  std::array<Piece, SearchConstants::MAX_PLY> prevPiece_{}; ///< Records the piece that moved at each ply.
+  std::array<int, SearchConstants::MAX_PLY> pvLength_;   ///< Tracks the length of the principal variation at each ply.
+  std::array<int, SearchConstants::MAX_PLY> evalHistory_{}; ///< Tracks static evaluation history for pruning thresholds.
+  
+  int currentIter_ = 0; ///< The current depth iteration in Iterative Deepening.
 
-  std::array<int, SearchConstants::MAX_PLY> pvLength_;
+  std::vector<Move> searchMoves_; ///< Restricts the search to only these root moves (used for 'searchmoves' command).
 
-  // State-Aware LMR and SE Tracking
-  std::array<int, SearchConstants::MAX_PLY> evalHistory_{};
-  int currentIter_ = 0;
+  InfoCallback infoCallback_; ///< Callback function to output search progress to the UCI protocol.
 
-  // Root move filtering (for searchMoves and MultiPV)
-  std::vector<Move> searchMoves_;
-
-  // Info callback
-  InfoCallback infoCallback_;
-
-  // Cheap evaluator for pre-NN filtering
-  SimpleEvalContext simpleEval_;
+  SimpleEvalContext simpleEval_; ///< A fast, simple evaluator used for pre-NN filtering or lazy evaluation.
 
 public:
+  /**
+   * @brief Constructs a new Negamax search instance.
+   * 
+   * @param eval Thread-local evaluator instance.
+   * @param table Global transposition table.
+   * @param shared Shared state for Lazy SMP coordination.
+   * @param isMainThread True if this instance is the primary search thread.
+   * @param threadId Unique identifier for this thread.
+   */
   Negamax(IEvaluator &eval, TranspositionTable &table,
           std::shared_ptr<SearchSharedData> shared, bool isMainThread,
           int threadId = 0);
 
-  // ISearch interface
   Move startSearch(Board &root, const SearchParams &params) override;
+  
   void stop() override {
     if (shared_)
       shared_->stop = true;
   }
+  
   bool isSearching() const override { return shared_ && !shared_->stop; }
+  
   void setInfoCallback(InfoCallback callback) override {
     infoCallback_ = callback;
   }
+  
   uint64_t getNodes() const override {
     return shared_ ? shared_->totalNodes.load(std::memory_order_relaxed) : 0;
   }
 
 private:
-  // Core search functions
+  /**
+   * @brief The core recursive Alpha-Beta search function.
+   * 
+   * @param board The current board state.
+   * @param depth The remaining search depth.
+   * @param alpha The lower bound of the current search window.
+   * @param beta The upper bound of the current search window.
+   * @param ply The current distance from the root.
+   * @param allowNull True if Null Move Pruning is permitted at this node.
+   * @param extensions The number of depth extensions applied so far along this path.
+   * @param prevWasCapture True if the move that led to this node was a capture.
+   * @param cutnode True if we expect this node to fail high (used for LMR scaling).
+   * @param excludedMove A move to ignore during search (used for Singular Extensions).
+   * @return The backed-up minimax score for the node.
+   */
   int alphaBeta(Board &board, int depth, int alpha, int beta, int ply,
                 bool allowNull, int extensions, bool prevWasCapture = false, bool cutnode = false, Move excludedMove = Move(0));
+
+  /**
+   * @brief Quiescence search to resolve tactical sequences before static evaluation.
+   * 
+   * Searches only captures and promotions to ensure the evaluation is stable.
+   * 
+   * @param board The current board state.
+   * @param alpha The lower bound.
+   * @param beta The upper bound.
+   * @param ply The distance from the root.
+   * @return The resolved stable score.
+   */
   int quiescence(Board &board, int alpha, int beta, int ply);
 
-  // Helper for Lazy Eval Pruning
+  /**
+   * @brief Determines if the position can bypass a full neural network evaluation.
+   * 
+   * @param board The board state.
+   * @param depth Remaining depth.
+   * @param alpha Alpha bound.
+   * @param beta Beta bound.
+   * @param ply Distance from root.
+   * @param fastScore Score from the fast/simple evaluator.
+   * @param outBound Output bound (Upper or Lower) if skipping is permitted.
+   * @param prevWasCapture True if previous move was a capture.
+   * @param pvNode True if this is a Principal Variation node.
+   * @return True if the evaluation can be skipped.
+   */
   bool canLazySkip(const Board &board, int depth, int alpha, int beta, int ply,
                    int fastScore, Bound &outBound, bool prevWasCapture,
                    bool pvNode);
 
-  // Move ordering (now used by MovePicker)
+  /**
+   * @brief Scores a move rapidly for sorting during move generation.
+   * 
+   * @param move The move to score.
+   * @param board The current board state.
+   * @param ttMove The best move retrieved from the Transposition Table.
+   * @param ply The current distance from the root.
+   * @param isCapture True if the move is a capture.
+   * @return The heuristic sorting score.
+   */
   int scoreMoveFast(const Move &move, const Board &board, Move ttMove, int ply,
                     bool isCapture);
+
+  /**
+   * @brief Updates killer move heuristics when a quiet move causes a beta cutoff.
+   * 
+   * @param move The move that caused the cutoff.
+   * @param ply The distance from root where the cutoff occurred.
+   */
   void updateKillers(Move move, int ply);
+
+  /**
+   * @brief Updates history and continuation history heuristics based on search results.
+   * 
+   * @param board The board state before the move.
+   * @param move The move executed.
+   * @param bonus The bonus/penalty to apply (based on search depth).
+   * @param ply The current distance from root.
+   */
   void updateHistory(const Board& board, Move move, int bonus, int ply);
 
-  // Helper for MovePicker to compute move scores
-  friend class MovePicker;
+  friend class MovePicker; ///< MovePicker requires access to `scoreMoveFast` and heuristics.
 
-  // Static Exchange Evaluation (SEE)
+  /**
+   * @brief Static Exchange Evaluation (SEE) for a move.
+   * 
+   * Evaluates the material consequence of a sequence of captures on a single square.
+   * 
+   * @param board The board state.
+   * @param move The capture move to evaluate.
+   * @return The material gain/loss score.
+   */
   int see(const Board &board, Move move) const;
+
+  /**
+   * @brief Returns the base material value of a piece type for SEE calculations.
+   */
   int pieceValue(PieceType pt) const;
 
-  // Extension helpers
+  /**
+   * @brief Applies historical corrections to the raw neural network evaluation.
+   * 
+   * Corrects systematic evaluation errors based on pawn structures and piece configurations.
+   * 
+   * @param rawEval The raw static evaluation.
+   * @param board The board state.
+   * @param ply The distance from root.
+   * @return The history-corrected evaluation.
+   */
+  int applyCorrHist(int rawEval, const Board &board, int ply) const;
+
+  // Extension condition checkers
   bool isPassedPawn(const Board &board, Square sq, Color side) const;
   bool isPawnPush7th(const Board &board, Move move) const;
 
-  // Time management (delegated to TimeManager)
+  // Time management helpers
   void syncTimeToShared();
   bool shouldStop() const;
   int64_t elapsedMs() const;
   bool shouldStopIteration(int depth, int score, Move bestMove) const;
 
-  // Utility
+  // General utilities
   bool isCapture(const Board &board, Move move) const;
   bool isDraw(const Board &board) const;
   int mateScore(int ply) const;
   bool isMateScore(int score) const {
-    return std::abs(score) >=
-           SearchConstants::MATE_IN_MAX - SearchConstants::MAX_PLY;
+    return std::abs(score) >= SearchConstants::MATE_IN_MAX - SearchConstants::MAX_PLY;
   }
 
-  // Reset state for new search
+  /**
+   * @brief Resets transient state arrays and variables before starting a new search.
+   */
   void clearState();
+
+  /**
+   * @brief Flushes local statistics (nodes, hits) to the global shared atomic counters.
+   */
+  void flushLocalSearchStats();
 };
