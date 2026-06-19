@@ -16,13 +16,15 @@
 
 <br />
 
-[**Challenge on Lichess**](https://lichess.org/@/io-bot) &nbsp;&nbsp;•&nbsp;&nbsp; [**Documentation**](https://alessandro-gobbetti.github.io/io-chess-engine/)
+[**Website**](https://www.io-chess.com/) &nbsp;&nbsp;•&nbsp;&nbsp; [**Challenge on Lichess**](https://lichess.org/@/io-bot) &nbsp;&nbsp;•&nbsp;&nbsp; [**Documentation**](https://alessandro-gobbetti.github.io/io-chess-engine/)
 
 </div>
 
 <br/>
 
 **io-chess** is a UCI-compatible chess engine written in modern C++20. It combines a high-performance alpha-beta search with a natively-compiled **Factorized Mixture-of-Experts (MoE)** neural network for position evaluation, achieving competitive play **without any runtime dependency on ONNX or other ML frameworks**.
+
+
 
 ## Project Structure
 
@@ -105,5 +107,8 @@ doxygen Doxyfile
 ```
 
 ## License
+This project is developed as a personal project, but future contributions are welcome. See the repository for licensing details.
 
-This project is developed as part of a university research initiative. See the repository for licensing details.
+---
+
+*Looking for the web interface? You can play against the engine and explore its architecture (and much more) at the [io-chess website](https://www.io-chess.com/), where everything runs entirely locally in your browser.*
