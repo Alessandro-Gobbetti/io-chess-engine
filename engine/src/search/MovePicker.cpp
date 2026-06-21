@@ -1,6 +1,9 @@
 /**
  * @file MovePicker.cpp
- * @brief Missing description.
+ * @brief Move generation, scoring, and selection logic for search.
+ *
+ * Implements staged move generation (Hash move, Captures, Killers, Quiet moves)
+ * and scoring heuristics like MVV-LVA and History heuristics to optimize alpha-beta pruning.
  * @ingroup engine
  */
 #include "MovePicker.h"

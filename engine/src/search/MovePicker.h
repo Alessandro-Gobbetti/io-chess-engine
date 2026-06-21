@@ -118,13 +118,41 @@ public:
    */
   Move nextMove(const Board &board, const Negamax *search, bool inCheck);
 
-private:
+  /**
+   * @brief Scores a move using various heuristics depending on its type.
+   * @param move The move to score.
+   * @param board The current board state.
+   * @param search Pointer to the Negamax search instance.
+   * @param isCapture True if the move is a capture.
+   * @return The heuristic score for the move.
+   */
   int scoreMove(const Move &move, const Board &board, const Negamax *search,
                 bool isCapture);
+
+  /**
+   * @brief Generates, scores, and stores all valid capture moves for the current node.
+   */
   void generateAndScoreCaptures(const Board &board, const Negamax *search);
+
+  /**
+   * @brief Extracts valid killer moves for the current ply and board state.
+   */
   void generateAndScoreKillers(const Board &board, const Negamax *search);
+
+  /**
+   * @brief Generates, scores, and stores all quiet moves for the current node.
+   */
   void generateAndScoreQuiets(const Board &board, const Negamax *search);
   
+  /**
+   * @brief Selects and removes the highest-scoring move from the remaining buffer.
+   * @tparam N The size of the buffer.
+   * @param list The array of moves.
+   * @param scores The array of corresponding scores.
+   * @param nextIdx The index marking the start of unselected moves.
+   * @param count The total number of valid moves in the buffer.
+   * @return The best Move.
+   */
   template<size_t N>
   Move selectBestMove(std::array<Move, N> &list, std::array<int, N> &scores,
                       int &nextIdx, int count);

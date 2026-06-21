@@ -1,7 +1,10 @@
 /**
  * @file Negamax.cpp
- * @brief Missing description.
- * @ingroup engine
+ * @brief Core implementation of the Alpha-Beta (Negamax) search algorithm.
+ * 
+ * This file contains the implementation of the main chess tree search algorithm.
+ * It includes iterative deepening, principal variation search, aspiration windows,
+ * and lazy SMP for multithreading. It also integrates evaluation and transposition tables.
  */
 #include "Negamax.h"
 #include "TablebaseFallback.h"

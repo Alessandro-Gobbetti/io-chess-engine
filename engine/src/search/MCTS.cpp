@@ -1,6 +1,9 @@
 /**
  * @file MCTS.cpp
- * @brief Missing description.
+ * @brief Monte Carlo Tree Search (MCTS) implementation.
+ *
+ * Implements a standard UCT (Upper Confidence bound applied to Trees) 
+ * based MCTS as an alternative to Alpha-Beta search. Largely experimental.
  * @ingroup engine
  */
 #include "MCTS.h"

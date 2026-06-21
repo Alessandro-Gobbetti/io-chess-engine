@@ -13,11 +13,11 @@
  * The data flow proceeds in two stages:
  *
  * @code{.unparsed}
- *   ┌────────────────────────┐     ┌─────────────────────┐
- *   │  Download & Filter     │────▶│      Shuffle         │
- *   │  prepare_dataset.py    │     │  shuffle_dataset.sh  │
- *   │  (HuggingFace → CSV)  │     │  (parallel, seeded)  │
- *   └────────────────────────┘     └─────────────────────┘
+ *   ┌────────────────────────┐     ┌──────────────────────┐
+ *   │  Download & Filter     │     │       Shuffle        │
+ *   │  prepare_dataset.py    │────▶│  shuffle_dataset.sh  │
+ *   │  (HuggingFace → CSV)   │     │  (parallel, seeded)  │
+ *   └────────────────────────┘     └──────────────────────┘
  * @endcode
  *
  * - @subpage data_prepare — Downloading and filtering the dataset

@@ -97,35 +97,83 @@ public:
    */
   void loop();
 
-  // Callbacks for options
+  // --- Callbacks for options ---
+  
+  /** @brief Resizes the transposition table memory block. */
   void resizeHash(size_t mb);
+  
+  /** @brief Restarts the search thread pool with the specified number of threads. */
   void updateThreads(int numThreads);
+  
+  /** @brief Performs a full re-initialization of the engine and evaluator state. */
   void reinitEngine();
+  
+  /** @brief Refreshes the thread-local evaluation contexts. */
   void updateEvalContexts();
+  
+  /** @brief Reloads the Syzygy tablebases from the configured path. */
   void initTablebase();
+  
+  /** @brief Reloads the Polyglot opening books from the configured paths. */
   void loadBooks();
+  
+  /** @brief Disables or enables the transposition table globally. */
   void setTTDisabled(bool disable);
+  
+  /** @brief Queues a saved TT snapshot file to be loaded before the next search. */
   void setPendingTTLoadFile(const std::string& file) { pendingTTLoadFile_ = file; }
 
 private:
-  // UCI command handlers
+  // --- UCI command handlers ---
+  
+  /** @brief Handles the 'uci' command (sends id and options). */
   void handleUci();
+  
+  /** @brief Handles the 'isready' command (initializes lazy resources). */
   void handleIsReady();
+  
+  /** @brief Handles the 'setoption' command to configure engine parameters. */
   void handleSetOption(std::istringstream &is);
+  
+  /** @brief Handles the 'ucinewgame' command (clears TT and search state). */
   void handleUciNewGame();
+  
+  /** @brief Handles the 'position' command to set up the board state. */
   void handlePosition(std::istringstream &is);
+  
+  /** @brief Handles the 'go' command to start a search with specified parameters. */
   void handleGo(std::istringstream &is);
+  
+  /** @brief Handles the 'ponderhit' command (converts a ponder search to a normal search). */
   void handlePonderHit();
+  
+  /** @brief Handles the 'stop' command to halt the current search immediately. */
   void handleStop();
+  
+  /** @brief Handles the 'quit' command to exit the engine process. */
   void handleQuit();
+  
+  /** @brief Handles the custom 'eval' command to print the static evaluation of the current position. */
   void handleEval();
 
-  // Helper functions
+  // --- Helper functions ---
+  
+  /** @brief Performs heavy lazy initialization of networks and threads. */
   void initializeEngine();
+  
+  /** @brief Formats an internal centipawn/mate score into a UCI-compliant string. */
   static std::string formatScore(int score);
+  
+  /** @brief Sends search progress information via 'info' UCI strings. */
   void sendInfo(int depth, int score, int nodes, int nps,
                 const std::vector<Move> &pv, const Board &board);
+                
+  /** @brief Sends the 'bestmove' UCI string to conclude a search. */
   void sendBestMove(Move move, Move ponderMove = Move(Move::NO_MOVE));
+  
+  /** @brief Dumps a snapshot of the Transposition Table to disk (for debugging). */
   void saveTTSnapshotForMove(const std::string &moveUci);
+  
+  /** @brief Sanitizes a UCI string to be safe for filesystem filenames. */
   static std::string sanitizeForFilename(const std::string &value);
 };

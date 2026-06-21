@@ -103,6 +103,17 @@
  * - **X-ray maps**: Rays that pass through a piece to attack a square
  *   behind it.
  *
+ * @subsection prep_feat_heuristic High-Level Heuristic Maps
+ *
+ * Board-wide bitboards identifying complex positional features:
+ *
+ * - **Absolute pins**: Pieces that cannot move because they shield the king from an attack.
+ * - **En prise (hanging) pieces**: Pieces that are attacked and not adequately defended.
+ * - **Safe mobility map**: Squares a piece can move to without being attacked by enemy pawns.
+ * - **King ring map**: The immediate squares surrounding both kings, weighted by attacks.
+ * - **Outposts**: Squares defended by friendly pawns and unassailable by enemy pawns.
+ * - **Open lines**: Files completely devoid of pawns or controlled by only one color.
+ *
  * @subsection prep_feat_scalar Scalar Features
  *
  * - Castling rights (4 bits: white/black kingside/queenside).

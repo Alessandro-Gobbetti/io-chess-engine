@@ -1,6 +1,9 @@
 /**
  * @file TablebaseFallback.cpp
- * @brief Missing description.
+ * @brief Tablebase integration fallback logic.
+ *
+ * Provides a fallback mechanism to probe Syzygy tablebases at the root 
+ * or during search to perfectly evaluate endgame positions.
  * @ingroup engine
  */
 #include "TablebaseFallback.h"

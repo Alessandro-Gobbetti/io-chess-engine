@@ -1,3 +1,11 @@
+/**
+ * @file TimeManager.cpp
+ * @brief Adaptive time management logic.
+ *
+ * Calculates optimal and hard time limits for a search based on the chosen time control,
+ * game phase, and remaining time. Includes logic to stop early if the score drops or if a forced mate is found.
+ * @ingroup engine
+ */
 #include "TimeManager.h"
 #include "../uci/UCI.h" // For SearchParams
 #include <algorithm>

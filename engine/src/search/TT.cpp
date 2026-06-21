@@ -1,6 +1,9 @@
 /**
  * @file TT.cpp
- * @brief Missing description.
+ * @brief Transposition Table (TT) implementation.
+ *
+ * A lock-less, aging-based hash table that caches previously evaluated positions
+ * to dramatically reduce the search tree size. Includes methods for saving, probing, and prefetching.
  * @ingroup engine
  */
 #include "TT.h"

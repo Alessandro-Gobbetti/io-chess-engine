@@ -69,6 +69,9 @@ private:
   static constexpr uint32_t kMagicWeights = 0x32454F4D; // MOE2
   static constexpr uint32_t kVersion = 1;
 
+  /**
+   * @brief Initializes the thread-local context from the pre-loaded shared weights.
+   */
   void init_from_shared_model(
       std::shared_ptr<const EvalContextMoECacheSharedModel> shared);
 
@@ -92,8 +95,14 @@ private:
   std::array<uint32_t, 2> evalsSinceFullByStm_{{0, 0}};
   std::atomic<uint64_t> totalRebuilds_{0};
 
+  /**
+   * @brief Reads a 32-bit unsigned integer from the binary weights stream.
+   */
   static uint32_t read_u32(std::ifstream &in);
   
+  /**
+   * @brief Reads a block of float values into a resizing container from the binary stream.
+   */
   template <typename FloatContainer>
   static void read_floats(std::ifstream &in, FloatContainer &dst, size_t n) {
     if constexpr (requires(FloatContainer &c, size_t m) { c.resize(m); }) {
@@ -108,9 +117,19 @@ private:
       throw std::runtime_error("Failed reading float block");
   }
   
+  /**
+   * @brief Reads a raw block of floats into a contiguous C-style array.
+   */
   static void read_floats_raw(std::ifstream &in, float *dst, size_t n);
+
+  /**
+   * @brief Converts an integer ID stored in the weights file to an ExpertPoolMode enum.
+   */
   static ExpertPoolMode pool_mode_from_code(int code);
   
+  /**
+   * @brief Copies and transposes a matrix tensor (used to align weights for faster cache hits during inference).
+   */
   template <typename SrcContainer, typename DstContainer>
   static void transpose_copy(const SrcContainer &src, DstContainer &dst,
                              int rows, int cols) {
@@ -128,8 +147,15 @@ private:
     }
   }
   
+  /**
+   * @brief Loads neural network weights from a binary file into a shared weights container.
+   */
   static void load_weights_into_target(const std::string &weightsPath,
                                        BenchConfig &cfg,
                                        SharedMoEWeights &weights);
+
+  /**
+   * @brief Loads neural network weights directly into the thread-local model (legacy usage).
+   */
   void load_weights_into_model(const std::string &weightsPath);
 };

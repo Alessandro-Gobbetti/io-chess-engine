@@ -1,6 +1,9 @@
 /**
  * @file UCI.cpp
- * @brief Missing description.
+ * @brief Universal Chess Interface (UCI) protocol parser and loop.
+ *
+ * Handles standard I/O communication with chess GUIs, parsing UCI commands
+ * to set up the board, configure engine parameters, and start/stop searches.
  * @ingroup engine
  */
 #include "UCI.h"

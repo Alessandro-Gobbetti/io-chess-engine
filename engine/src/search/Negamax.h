@@ -236,20 +236,76 @@ private:
    */
   int applyCorrHist(int rawEval, const Board &board, int ply) const;
 
-  // Extension condition checkers
+  // --- Extension Condition Checkers ---
+  
+  /**
+   * @brief Determines if the pawn on the given square is a passed pawn.
+   * @param board The current board state.
+   * @param sq The square of the pawn.
+   * @param side The color of the pawn.
+   * @return True if the pawn has no opposing pawns blocking its path to promotion.
+   */
   bool isPassedPawn(const Board &board, Square sq, Color side) const;
+
+  /**
+   * @brief Determines if the move pushes a pawn to the 7th rank (or 2nd for black).
+   * @param board The current board state.
+   * @param move The move to evaluate.
+   * @return True if it is a 7th rank pawn push.
+   */
   bool isPawnPush7th(const Board &board, Move move) const;
 
-  // Time management helpers
+  // --- Time Management Helpers ---
+
+  /**
+   * @brief Syncs the thread-local elapsed time to the shared data for the main thread.
+   */
   void syncTimeToShared();
+
+  /**
+   * @brief Checks if the search should be aborted due to time limits or external stop signals.
+   * @return True if the search must stop immediately.
+   */
   bool shouldStop() const;
+
+  /**
+   * @brief Calculates the elapsed time since the search started.
+   * @return Elapsed time in milliseconds.
+   */
   int64_t elapsedMs() const;
+
+  /**
+   * @brief Decides whether to stop the search early at the end of an Iterative Deepening iteration.
+   * 
+   * Triggers soft time limits early if the best move seems stable and no score drops have occurred.
+   * 
+   * @param depth The completed search depth.
+   * @param score The best score achieved at this depth.
+   * @param bestMove The best move found.
+   * @return True if the search should be terminated.
+   */
   bool shouldStopIteration(int depth, int score, Move bestMove) const;
 
-  // General utilities
+  // --- General Utilities ---
+
+  /**
+   * @brief Returns true if the move is a capture.
+   */
   bool isCapture(const Board &board, Move move) const;
+
+  /**
+   * @brief Returns true if the position is a theoretical draw (e.g. 50-move rule, 3-fold repetition, insufficient material).
+   */
   bool isDraw(const Board &board) const;
+
+  /**
+   * @brief Returns the mate score adjusted for the current ply (so closer mates score higher).
+   */
   int mateScore(int ply) const;
+
+  /**
+   * @brief Checks if the given score is within the checkmate score range.
+   */
   bool isMateScore(int score) const {
     return std::abs(score) >= SearchConstants::MATE_IN_MAX - SearchConstants::MAX_PLY;
   }

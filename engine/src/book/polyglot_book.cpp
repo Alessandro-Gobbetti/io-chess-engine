@@ -1,6 +1,9 @@
 /**
  * @file polyglot_book.cpp
- * @brief Missing description.
+ * @brief Polyglot opening book reader.
+ *
+ * Provides functionality to open, parse, and query binary Polyglot (.bin) opening 
+ * books to find pre-computed moves for the opening phase of the game.
  * @ingroup engine
  */
 #include "polyglot_book.hpp"

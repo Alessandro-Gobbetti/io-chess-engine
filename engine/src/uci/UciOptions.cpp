@@ -1,6 +1,9 @@
 /**
  * @file UciOptions.cpp
- * @brief Missing description.
+ * @brief UCI Options configuration manager.
+ *
+ * Parses, validates, and stores runtime configurable options exposed by the engine 
+ * over the Universal Chess Interface protocol (e.g. Hash size, Threads, Hash table usage).
  * @ingroup engine
  */
 #include "UciOptions.h"

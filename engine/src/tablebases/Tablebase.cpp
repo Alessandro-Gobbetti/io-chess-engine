@@ -1,6 +1,9 @@
 /**
  * @file Tablebase.cpp
- * @brief Missing description.
+ * @brief Syzygy Endgame Tablebase probe interface.
+ *
+ * Wraps the Fathom library to probe Syzygy tablebases (WDL and DTZ) for perfect 
+ * play in endgames with a limited number of pieces.
  * @ingroup engine
  */
 #include "Tablebase.h"

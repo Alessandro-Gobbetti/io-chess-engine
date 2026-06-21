@@ -1,6 +1,9 @@
 /**
  * @file BatchEvalContext.h
- * @brief Missing description.
+ * @brief Batched evaluation context interface.
+ *
+ * Provides structures and abstract methods for evaluating multiple chess positions 
+ * simultaneously, optimizing throughput for certain neural network architectures.
  * @ingroup engine
  */
 #pragma once

@@ -1,6 +1,9 @@
 /**
  * @file Evaluator.cpp
- * @brief Missing description.
+ * @brief Runtime evaluator manager implementation.
+ *
+ * Handles the instantiation of thread-local evaluation contexts, loading shared neural 
+ * network weights, and routing evaluation requests during the game.
  * @ingroup engine
  */
 // Evaluator.cpp - runtime evaluator manager

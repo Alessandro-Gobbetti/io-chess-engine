@@ -1,6 +1,9 @@
 /**
  * @file EvalContextMoECache.cpp
- * @brief Missing description.
+ * @brief Implementation of the thread-local MoE evaluator.
+ *
+ * Implements the incremental accumulator state updates and rapid board 
+ * evaluation logic using the Factorized Mixture of Experts (MoE) network.
  * @ingroup engine
  */
 #include "EvalContextMoECache.h"

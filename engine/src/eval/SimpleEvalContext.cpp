@@ -1,6 +1,9 @@
 /**
  * @file SimpleEvalContext.cpp
- * @brief Missing description.
+ * @brief Hand-crafted classical evaluation implementation.
+ *
+ * Implements a non-neural, highly optimized handcrafted evaluation function based on
+ * Piece-Square Tables, pawn structure, and mobility. Used as a fallback or for fast pre-filtering.
  * @ingroup engine
  */
 #include "SimpleEvalContext.h"

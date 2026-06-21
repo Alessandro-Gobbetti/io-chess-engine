@@ -228,6 +228,8 @@ tools/search_tree*.html
 *.log
 
 # --- Machine Learning & Models ---
+*.onnx
+*.data
 training/models/*.onnx
 training/models/*.pth
 eval_model_onnx/*.data

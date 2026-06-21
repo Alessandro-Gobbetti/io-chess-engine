@@ -1,6 +1,9 @@
 /**
  * @file polyglot_keys.cpp
- * @brief Missing description.
+ * @brief Polyglot Zobrist hashing keys.
+ *
+ * Defines the specific Zobrist random numbers and hashing logic required to perfectly
+ * match the keys used in Polyglot opening books.
  * @ingroup engine
  */
 #include "polyglot_keys.hpp"
