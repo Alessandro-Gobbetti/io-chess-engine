@@ -239,3 +239,7 @@ data/processed/*.bin
 # --- Scripts & Temp ---
 run_match*.sh
 test_defaults.*
+
+# --- Generated Doxygen Output ---
+html/
+latex/

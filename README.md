@@ -35,7 +35,7 @@ The project is designed end-to-end, spanning data acquisition, feature extractio
 *   **[Training](training/)**: A PyTorch training pipeline for the Factorized MoE network, implementing a multi-phase curriculum for expert specialization and weight export.
 *   **[Data](data/)**: Python and shell utilities for downloading, filtering, and shuffling the HuggingFace evaluation dataset.
 
-For a comprehensive overview of the architecture, please refer to the [Documentation](docs/).
+For a comprehensive overview of the architecture, please refer to the [Documentation](https://alessandro-gobbetti.github.io/io-chess-engine/).
 
 ## Architecture Highlights
 
@@ -87,8 +87,13 @@ emmake make -j$(nproc)
 
 **io-chess** communicates via the Universal Chess Interface (UCI) protocol and can be attached to standard GUIs (e.g., Cute Chess, Arena, Lichess-bot).
 
+**Command-Line Options:**
 ```bash
-./io-chess
+./io-chess --model <path>           # Path to native_weights.bin directory (required for Neural eval)
+./io-chess --simple-eval            # Use classical PeSTO evaluation (no model needed)
+./io-chess --syzygy <path>          # Path to Syzygy tablebases (optional; also reads SYZYGY_PATH env)
+./io-chess --book <path>            # Path to Polyglot opening book (optional)
+./io-chess --book2 <path>           # Path to secondary opening book (optional)
 ```
 
 **Supported UCI Commands:**
@@ -100,14 +105,17 @@ emmake make -j$(nproc)
 
 ## Documentation
 
-Full architectural documentation is available in the `docs/` directory. You can generate the comprehensive HTML documentation using Doxygen:
+Full architectural documentation is hosted online at **[Documentation](https://alessandro-gobbetti.github.io/io-chess-engine/)**.
+
+To generate the documentation locally:
 
 ```bash
 doxygen Doxyfile
 ```
 
 ## License
-This project is developed as a personal project, but future contributions are welcome. See the repository for licensing details.
+
+This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
 
 ---
 
